@@ -3,6 +3,7 @@
 .Python
 .DS_Store
 .installed.cfg
+.mr.developer*
 bin
 include
 lib
