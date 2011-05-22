@@ -7,7 +7,6 @@
 bin
 include
 lib
-src
 eggs
 develop-eggs
 parts

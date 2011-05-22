@@ -1,0 +1,6 @@
+[submodule "src/voteit.schulze"]
+	path = src/voteit.schulze
+	url = git@github.com:VoteIT/voteit.schulze.git
+[submodule "src/voteit.core"]
+	path = src/voteit.core
+	url = git@github.com:VoteIT/voteit.core.git
