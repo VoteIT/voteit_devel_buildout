@@ -4,6 +4,7 @@
 .DS_Store
 .installed.cfg
 .mr.developer*
+.settings
 bin
 include
 lib
