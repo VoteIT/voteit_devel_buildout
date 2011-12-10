@@ -23,11 +23,14 @@ As a normal user, type the following to fetch the code from or repository:
 
 To clone the current repository
 
-  git git://github.com/VoteIT/voteit_devel_buildout.git
+  git clone git://github.com/VoteIT/voteit_devel_buildout.git
 
 Go into the directory
 
   cd voteit_devel_buildout
+
+If you don't have commit rights to the VoteIT repositories,
+you might need to change the [sources] urls in buildout.cfg
   
 Install a copy of Python so we don't mess with the system Python.
 
