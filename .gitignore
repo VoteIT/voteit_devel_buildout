@@ -5,6 +5,7 @@
 .installed.cfg
 .mr.developer*
 .settings
+etc/salt.txt
 bin
 include
 lib
