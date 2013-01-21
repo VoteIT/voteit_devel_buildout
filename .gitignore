@@ -5,6 +5,7 @@
 .installed.cfg
 .mr.developer*
 .settings
+*.pyc
 etc/salt.txt
 bin
 include
