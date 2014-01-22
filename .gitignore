@@ -8,6 +8,7 @@
 *.pyc
 etc/salt.txt
 etc/login_providers.ini
+etc/velruse_providers.ini
 bin
 include
 lib
