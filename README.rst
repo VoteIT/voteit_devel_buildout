@@ -16,7 +16,7 @@ Development instructions for VoteIT. You need to have:
 * C-compiler and python-dev package.
 
 
-VoteIT manual: http://manaual.voteit.se
+VoteIT manual: http://manual.voteit.se
 
 
 Getting the code & building the server
