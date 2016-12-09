@@ -1,3 +1,4 @@
+
 from __future__ import unicode_literals
 import argparse
 from math import floor
@@ -46,6 +47,8 @@ def print_voting_timestamps(poll, request):
     print "Minutes".ljust(20), "Voters"
     for (k, v) in sv_times:
         print str(k).ljust(20), v
+    print "\n"
+    print "Total:".ljust(20), sum(vote_times.values())
 
 
 if __name__ == '__main__':
