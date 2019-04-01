@@ -6,13 +6,10 @@ Development instructions for VoteIT. You need to have:
 * a POSIX-compatible operating system. As far as we know, all Linux / UNIX
   version work, including Mac Os X. We haven't tested with Windows.
 * Git installed. (See http://git-scm.com)
-* Python installed. We're currently developing on Python 2.7. Any lower version
-  is not recommended. Also, it's very unlikely that Python 3.x will work.
-* Setuptools for Python installed. If you can type "easy_install" in a
-  terminal, you have it.
+* Python installed. We're currently ONLY support Python 2.7.
+* Setuptools and pip
   (See http://packages.python.org/an_example_pypi_project/setuptools.html)
-* Virtualenv for Python. (Installed with "easy_install virtualenv" as root.
-  See http://www.virtualenv.org for more information)
+* Virtualenv for Python. (Recommended but optional)
 * C-compiler and python-dev package.
 
 
@@ -35,17 +32,16 @@ Go into the directory
 If you don't have commit rights to the VoteIT repositories,
 you might need to change the [sources] urls in buildout.cfg
   
-Install a copy of Python so we don't mess with the system Python.
+Install a copy of Python so we don't mess with the system Python. Also upgrade the local pip and setuptools
 
-  virtualenv .
+  virtualenv . -ppython2.7
+  source bin/activate
+  pip install --upgrade setuptools pip
   
-Run bootstrap process. See http://buildout.org for more info.
+Install buildout and run bootstrap process. See http://buildout.org for more info.
 
-  bin/python bootstrap.py
-
-A buildout file should now have been created - We'll run it to build the server
-
-  bin/buildout
+  pip install zc.buildout
+  buildout
 
 Have a cup of [tea|coffee]...
 As buildout runs, it will fetch the voteit.core package and put it in the src directory
@@ -55,7 +51,7 @@ Running the development server
 
 To start the server.
 
-  bin/pserve etc/development.ini
+  pserve etc/development.ini
 
 After a few seconds, it should display something like:
 
