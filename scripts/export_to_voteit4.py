@@ -175,7 +175,7 @@ def export_root(obj):
 
 @debugencode
 def export_user(user, pk):
-    if user.email:
+    if user.email_validated and user.email:
         email = user.email.lower()
         if email in emails:
             add_error(user, 'Duplicate email: {email}', email=email)
