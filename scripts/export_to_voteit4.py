@@ -1,21 +1,36 @@
 from __future__ import unicode_literals
+
 import argparse
 import re
 import sys
 from datetime import datetime
-from json import dump, dumps
+from datetime import timedelta
+from json import dump
+from json import dumps
 from uuid import uuid4
+
 from pyramid.paster import bootstrap
 from pyramid.traversal import resource_path
-
-from voteit.core.models.interfaces import IMentioned, IDiffText
-from voteit.irl.models.interfaces import IParticipantNumbers, IElectoralRegister
-from voteit.debate.models import speaker_lists
+from voteit.core.helpers import AT_PATTERN
+from voteit.core.helpers import TAG_PATTERN
+from voteit.core.models.interfaces import IDiffText
+from voteit.core.models.interfaces import IMentioned
+from voteit.core.security import ROLE_ADMIN
+from voteit.core.security import ROLE_DISCUSS
+from voteit.core.security import ROLE_MEETING_CREATOR
+from voteit.core.security import ROLE_MODERATOR
+from voteit.core.security import ROLE_OWNER
+from voteit.core.security import ROLE_PROPOSE
+from voteit.core.security import ROLE_VIEWER
+from voteit.core.security import ROLE_VOTER
 from voteit.debate.interfaces import ISpeakerListSettings
-from voteit.core.helpers import TAG_PATTERN, AT_PATTERN
+from voteit.debate.models import speaker_lists
+from voteit.irl.models.interfaces import IElectoralRegister
+from voteit.irl.models.interfaces import IParticipantNumbers
 
 # Settings
 SINGLE_ERROR = False
+ONLY_MEETING_NAME = None
 REPORT_NOT_CLOSED = False
 
 userid_to_pk = {}
@@ -26,9 +41,17 @@ ai_uid_to_pk = {}
 proposal_uid_to_pk = {}
 # key like f"{ai_pk}:{paragraph}"
 diff_text_ai_pk_and_paragraph_to_pk = {}
+needed_userids = set()
 
 errors = {}
 unique_errors = set()
+emails = set()
+
+
+def get_pk_for_userid(userid):
+    needed_userids.add(userid)
+    return userid_to_pk[userid]
+
 
 # VoteIT3 as key
 # FIXME:
@@ -41,6 +64,18 @@ poll_method_mapping = {
     'dutt_poll': 'dutt',
     'schulze_pr': 'schulze_pr',
     'schulze_stv': 'schulze_stv',
+}
+
+
+role_map = {
+    ROLE_VIEWER: "participant",
+    ROLE_MODERATOR: 'moderator',
+    ROLE_VOTER: 'potential_voter',  # Quirk!
+    ROLE_DISCUSS: 'discusser',
+    ROLE_PROPOSE: 'proposer',
+    ROLE_ADMIN: '',
+    ROLE_MEETING_CREATOR: '',
+    ROLE_OWNER: '',
 }
 
 
@@ -63,6 +98,8 @@ def debugencode(fn):
             print("fn %s cased exc with data:" % fn.__name__)
             print(result)
             raise
+        if {'pk', 'fields', 'model'} != set(result):
+            raise ValueError("Wrong keys in result: %s" % result.keys())
         return result
 
     return _inner
@@ -109,7 +146,7 @@ def text_to_v4_mention(text):
         # space, userid = matchobj.group(1, 2)
         userid = matchobj.group(2)
         userid = userid.lower()
-        return " %s" % mk_v4_usertag(userid_to_pk[userid])
+        return " %s" % mk_v4_usertag( get_pk_for_userid(userid))
 
     return re.sub(AT_PATTERN, handle_match, text)
 
@@ -138,6 +175,15 @@ def export_root(obj):
 
 @debugencode
 def export_user(user, pk):
+    if user.email:
+        email = user.email.lower()
+        if email in emails:
+            add_error(user, 'Duplicate email: {email}', email=email)
+        emails.add(email)
+    else:
+        email = ""
+    if user.userid != user.userid.lower():
+        raise ValueError("Uppercase userid: %s" % user.userid)
     return {
         'pk': pk,
         'model':'core.user',
@@ -145,7 +191,7 @@ def export_user(user, pk):
             'first_name': user.first_name,
             'last_name': user.last_name,
             'date_joined': django_format_datetime( user.created),
-            'email': user.email,
+            'email': email,
             'organisation': 1,  #Will be remapped
             'userid': user.userid,
             'username': str(uuid4()),
@@ -228,13 +274,16 @@ def reformat_schulze_round(result):
 
 
 @debugencode
-def export_poll(poll, pk, meeting_pk, ai_pk):
+def export_poll(poll, pk, meeting_pk, ai_pk, er_pk=None):
     state = poll.get_workflow_state()
-    if state != 'closed':
-        if REPORT_NOT_CLOSED:
-            add_error(poll, 'Not closed, skipped')
+    is_closed = state == 'closed'
+    is_ongoing = state == 'ongoing'
+    if not is_closed and REPORT_NOT_CLOSED:
+        add_error(poll, 'Warning: not closed')
+    if is_ongoing and er_pk is None:
+        add_error(poll, 'Poll open without er, aborting export')
         return
-    if not poll.poll_result:
+    if not poll.poll_result and is_closed:
         add_error(poll, 'No result data:\n{res}', res=poll.poll_result)
         return
     proposals = []
@@ -246,12 +295,14 @@ def export_poll(poll, pk, meeting_pk, ai_pk):
     settings = dict(poll.poll_settings)
     poll_plugin = poll.poll_plugin
 
-    if poll_plugin not in ('dutt_poll', 'majority_poll'):
-        try:
-            result = dict(poll.poll_result)
-        except Exception as exc:
-            add_error(poll, "Result data isn't a dict, skipping")
-            return
+    result = None
+    if is_closed:
+        if poll_plugin not in ('dutt_poll', 'majority_poll'):
+            try:
+                result = dict(poll.poll_result)
+            except Exception as exc:
+                add_error(poll, "Result data isn't a dict, skipping")
+                return
 
     if poll_plugin == 'sorted_schulze':
         winners = settings.get('winners', None)
@@ -260,118 +311,120 @@ def export_poll(poll, pk, meeting_pk, ai_pk):
         elif winners == 1:
             # This is basically someone who's done something very weird. And silly us for allowing it.
             poll_plugin = 'schulze'
-            result = result['rounds'][0]
+            if is_closed:
+                result = result['rounds'][0]
 
     # Change result format to match V4
-    if poll_plugin == 'schulze_pr':
-        result['candidates'] = [proposal_uid_to_pk[x] for x in result['candidates']]
-        result['order'] = [proposal_uid_to_pk[x] for x in result['order']]
-        result['rounds'] = [{'winner': proposal_uid_to_pk[x['winner']]} for x in result['rounds']]
-    elif poll_plugin == 'schulze':
-        if 'winner' not in result:
-            add_error(poll, "No winner in result data, skipping")
-            return
-        reformat_schulze_round(result)
-    elif poll_plugin == 'sorted_schulze':
-        if 'winners' not in result:
-            add_error(poll, "No winners in result data, skipping")
-            return
-        # Winners aren't part of the new style results
-        result['winners'].pop()
-        result['candidates'] = [proposal_uid_to_pk[x] for x in result['candidates']]
-        for round in result['rounds']:
-            # Modified in place
-            reformat_schulze_round(round)
+    if is_closed:
+        if poll_plugin == 'schulze_pr':
+            result['candidates'] = [proposal_uid_to_pk[x] for x in result['candidates']]
+            result['order'] = [proposal_uid_to_pk[x] for x in result['order']]
+            result['rounds'] = [{'winner': proposal_uid_to_pk[x['winner']]} for x in result['rounds']]
+        elif poll_plugin == 'schulze':
+            if 'winner' not in result:
+                add_error(poll, "No winner in result data, skipping")
+                return
+            reformat_schulze_round(result)
+        elif poll_plugin == 'sorted_schulze':
+            if 'winners' not in result:
+                add_error(poll, "No winners in result data, skipping")
+                return
+            # Winners aren't part of the new style results
+            result['winners'].pop()
+            result['candidates'] = [proposal_uid_to_pk[x] for x in result['candidates']]
+            for round in result['rounds']:
+                # Modified in place
+                reformat_schulze_round(round)
 
-    # class SchulzePollResult(PollResult):
-    #     pairs: List[Tuple[Tuple[int, int], int]]
-    #     candidates: List[int]
-    #     winner: int
-    #     strong_pairs: List[Tuple[Tuple[int, int], int]]
-    #     tied_winners: Optional[List[int]]
-    elif poll_plugin == 'schulze_stv':
-        if 'tie_breaker' in result:
-            result['tie_breaker'] = [proposal_uid_to_pk[x] for x in result['tie_breaker']]
-        if 'tied_winners' in result:
-            tied = []
-            for row in result['tied_winners']:
-                # Is this the correct format? :)
-                tied.extend([proposal_uid_to_pk[x] for x in row])
-            result['tied_winners'] = tied
-        result['candidates'] = [proposal_uid_to_pk[x] for x in result['candidates']]
-        if 'winners' not in result:
-            add_error(poll, "No winners in result data, skipping")
-            return
-        result['winners'] = [proposal_uid_to_pk[x] for x in result['winners']]
-        # Let's not care about the other parts
-        result.pop('actions', None)
-    elif poll_plugin == 'scottish_stv':
-        result['winners'] = [proposal_uid_to_pk[x] for x in result['winners']]
-        result['candidates'] = [proposal_uid_to_pk[x] for x in result['candidates']]
-        rounds = []
-        for round_data in result['rounds']:
-            # Expects:
-            # class STVResultRoundSchema(BaseModel):
-            #     method: str
-            #     status: str
-            #     selected: List[int]
-            #     vote_count: List[Tuple[int, Decimal]]
-            round = {}
-            round.update(round_data)
-            round['selected'] = [proposal_uid_to_pk[x] for x in round_data['selected']]
-            round['vote_count'] = []
-            for x in round_data['vote_count']:
-                # A dict
-                for k, v in x.items():
-                    round['vote_count'].append([proposal_uid_to_pk[k], str(v)])
-            rounds.append(round)
-        result['rounds'] = rounds
-        # {u'complete': False, u'quota': 1, u'randomized': False, u'winners': (u'cf555e02-dab9-4520-84fe-6fe3da786105',),
-        #  u'candidates': (u'9a532d8c-ea42-496c-9eb2-e61a504381bd', u'e60f4303-d163-406c-9357-8a5bdfa2c7ed',
-        #                  u'cf555e02-dab9-4520-84fe-6fe3da786105'), u'runtime': 0.0009920597076416016, u'rounds': (
-        # {u'status': u'Elected', u'vote_count': ({u'9a532d8c-ea42-496c-9eb2-e61a504381bd': Decimal('0')},
-        #                                         {u'e60f4303-d163-406c-9357-8a5bdfa2c7ed': Decimal('0')},
-        #                                         {u'cf555e02-dab9-4520-84fe-6fe3da786105': Decimal('2')}),
-        #  u'selected': (u'cf555e02-dab9-4520-84fe-6fe3da786105',), u'method': u'Direct'},), u'empty_ballot_count': 0}
-    elif poll_plugin == 'combined_simple':
-        reformed_result = {}
-        for k, res in result.items():
-            reformed_result[proposal_uid_to_pk[k]] = {'yes': res['approve'],
-                                                      'no': res['deny'],
-                                                      'abstain': res['abstain']}
-        result = {'results': reformed_result}
-    elif poll_plugin == 'dutt_poll':
-        # [{'num': 4, 'percent': u'57.1%', 'uid': u'f9635154-68f5-4a17-9940-59a179af6a49'},
-        #  {'num': 4, 'percent': u'57.1%', 'uid': u'8bfcf698-92e8-4921-bb68-24f13fdd116e'},
-        #  {'num': 3, 'percent': u'42.9%', 'uid': u'15e4ed84-dc5e-4080-af24-1a4752ee6945'},
-        #  {'num': 1, 'percent': u'14.3%', 'uid': u'f19460d8-87f8-406e-8d30-5861ad1a6fd3'}]
-        if 'num' not in poll.poll_result[0]:
-            add_error(poll, "Dutt poll with bad result data, skipping")
-            return
-        reformatted_results = []
-        for item in poll.poll_result:
-            reformatted_results.append(
-                {'votes': item['num'], 'proposal': proposal_uid_to_pk[item['uid']]}
-            )
-        result = {'results': reformatted_results}
-    elif poll_plugin == 'majority_poll':
-        # And weirdest format so far:
-        # ({u'count': 350, u'num': Decimal('0.7070707070707070707070707071'),
-        #   u'uid': {'proposal': u'97ba9200-d2d1-49e8-ba81-37cb076b3829'}},
-        #  {u'count': 145, u'num': Decimal('0.2929292929292929292929292929'),
-        #   u'uid': {'proposal': u'e6ee02b9-aff4-43ca-9b46-d53487dbca61'}})
-        reformatted_results = []
-        for item in poll.poll_result:
-            reformatted_results.append(
-                {'votes': item['count'], 'proposal':  proposal_uid_to_pk[item['uid']['proposal']]}
-            )
-        result = {'results': reformatted_results}
+        # class SchulzePollResult(PollResult):
+        #     pairs: List[Tuple[Tuple[int, int], int]]
+        #     candidates: List[int]
+        #     winner: int
+        #     strong_pairs: List[Tuple[Tuple[int, int], int]]
+        #     tied_winners: Optional[List[int]]
+        elif poll_plugin == 'schulze_stv':
+            if 'tie_breaker' in result:
+                result['tie_breaker'] = [proposal_uid_to_pk[x] for x in result['tie_breaker']]
+            if 'tied_winners' in result:
+                tied = []
+                for row in result['tied_winners']:
+                    # Is this the correct format? :)
+                    tied.extend([proposal_uid_to_pk[x] for x in row])
+                result['tied_winners'] = tied
+            result['candidates'] = [proposal_uid_to_pk[x] for x in result['candidates']]
+            if 'winners' not in result:
+                add_error(poll, "No winners in result data, skipping")
+                return
+            result['winners'] = [proposal_uid_to_pk[x] for x in result['winners']]
+            # Let's not care about the other parts
+            result.pop('actions', None)
+        elif poll_plugin == 'scottish_stv':
+            result['winners'] = [proposal_uid_to_pk[x] for x in result['winners']]
+            result['candidates'] = [proposal_uid_to_pk[x] for x in result['candidates']]
+            rounds = []
+            for round_data in result['rounds']:
+                # Expects:
+                # class STVResultRoundSchema(BaseModel):
+                #     method: str
+                #     status: str
+                #     selected: List[int]
+                #     vote_count: List[Tuple[int, Decimal]]
+                round = {}
+                round.update(round_data)
+                round['selected'] = [proposal_uid_to_pk[x] for x in round_data['selected']]
+                round['vote_count'] = []
+                for x in round_data['vote_count']:
+                    # A dict
+                    for k, v in x.items():
+                        round['vote_count'].append([proposal_uid_to_pk[k], str(v)])
+                rounds.append(round)
+            result['rounds'] = rounds
+            # {u'complete': False, u'quota': 1, u'randomized': False, u'winners': (u'cf555e02-dab9-4520-84fe-6fe3da786105',),
+            #  u'candidates': (u'9a532d8c-ea42-496c-9eb2-e61a504381bd', u'e60f4303-d163-406c-9357-8a5bdfa2c7ed',
+            #                  u'cf555e02-dab9-4520-84fe-6fe3da786105'), u'runtime': 0.0009920597076416016, u'rounds': (
+            # {u'status': u'Elected', u'vote_count': ({u'9a532d8c-ea42-496c-9eb2-e61a504381bd': Decimal('0')},
+            #                                         {u'e60f4303-d163-406c-9357-8a5bdfa2c7ed': Decimal('0')},
+            #                                         {u'cf555e02-dab9-4520-84fe-6fe3da786105': Decimal('2')}),
+            #  u'selected': (u'cf555e02-dab9-4520-84fe-6fe3da786105',), u'method': u'Direct'},), u'empty_ballot_count': 0}
+        elif poll_plugin == 'combined_simple':
+            reformed_result = {}
+            for k, res in result.items():
+                reformed_result[proposal_uid_to_pk[k]] = {'yes': res['approve'],
+                                                          'no': res['deny'],
+                                                          'abstain': res['abstain']}
+            result = {'results': reformed_result}
+        elif poll_plugin == 'dutt_poll':
+            # [{'num': 4, 'percent': u'57.1%', 'uid': u'f9635154-68f5-4a17-9940-59a179af6a49'},
+            #  {'num': 4, 'percent': u'57.1%', 'uid': u'8bfcf698-92e8-4921-bb68-24f13fdd116e'},
+            #  {'num': 3, 'percent': u'42.9%', 'uid': u'15e4ed84-dc5e-4080-af24-1a4752ee6945'},
+            #  {'num': 1, 'percent': u'14.3%', 'uid': u'f19460d8-87f8-406e-8d30-5861ad1a6fd3'}]
+            if 'num' not in poll.poll_result[0]:
+                add_error(poll, "Dutt poll with bad result data, skipping")
+                return
+            reformatted_results = []
+            for item in poll.poll_result:
+                reformatted_results.append(
+                    {'votes': item['num'], 'proposal': proposal_uid_to_pk[item['uid']]}
+                )
+            result = {'results': reformatted_results}
+        elif poll_plugin == 'majority_poll':
+            # And weirdest format so far:
+            # ({u'count': 350, u'num': Decimal('0.7070707070707070707070707071'),
+            #   u'uid': {'proposal': u'97ba9200-d2d1-49e8-ba81-37cb076b3829'}},
+            #  {u'count': 145, u'num': Decimal('0.2929292929292929292929292929'),
+            #   u'uid': {'proposal': u'e6ee02b9-aff4-43ca-9b46-d53487dbca61'}})
+            reformatted_results = []
+            for item in poll.poll_result:
+                reformatted_results.append(
+                    {'votes': item['count'], 'proposal':  proposal_uid_to_pk[item['uid']['proposal']]}
+                )
+            result = {'results': reformatted_results}
 
-    # result['approved'] = xxx
-    # result['denied'] = xxx
-    result['vote_count'] = len(poll)
+        # result['approved'] = xxx
+        # result['denied'] = xxx
+        result['vote_count'] = len(poll)
 
-    return {
+    data = {
         'pk': pk,
         'model': 'poll.poll',
         'fields': {
@@ -386,14 +439,17 @@ def export_poll(poll, pk, meeting_pk, ai_pk):
             'agenda_item': ai_pk,
             'method_name': poll_method_mapping[poll_plugin],
             'proposals': proposals,
+            'electoral_register': is_ongoing and er_pk or None,
             #FIXME: This needs to be converted to a format that VoteIT4 expects
-            'result_data': result,
-            'ballot_data': poll.ballots, # FIXME
             'settings_data': settings,
             'abstains': 0,  # ?
             # ballot_checksum: null ?
         },
     }
+    if is_closed:
+        data['fields']['result_data'] = result
+        data['fields']['ballot_data'] = poll.ballots
+    return data
 
 
 def reverse_schulze_vote(poll, vote_data):
@@ -479,13 +535,13 @@ def export_proposal(proposal, pk, ai_pk, author_pk=None, meeting_group_pk=None):
             'prop_id': proposal.aid,
             'agenda_item': ai_pk,
             'tags': proposal.tags,
-            'mentions': [userid_to_pk[x] for x in IMentioned(proposal).keys()]
+            'mentions': [get_pk_for_userid(x) for x in IMentioned(proposal).keys()]
         },
     }
     if author_pk:
-        data['author'] = author_pk
+        data['fields']['author'] = author_pk
     else:
-        data['meeting_group'] = meeting_group_pk
+        data['fields']['meeting_group'] = meeting_group_pk
     return data
 
 
@@ -514,14 +570,14 @@ def export_discussion_post(discussion_post, pk, ai_pk, author_pk = None, meeting
             'created': django_format_datetime(discussion_post.created),
             'body': body,
             'tags': discussion_post.tags,
-            'mentions': [userid_to_pk[x] for x in IMentioned(discussion_post).keys()],
+            'mentions': [get_pk_for_userid(x) for x in IMentioned(discussion_post).keys()],
             'agenda_item': ai_pk,
         },
     }
     if author_pk:
-        data['author'] = author_pk
+        data['fields']['author'] = author_pk
     else:
-        data['meeting_group'] = meeting_group_pk
+        data['fields']['meeting_group'] = meeting_group_pk
     return data
 
 
@@ -585,13 +641,12 @@ def export_pn(pk, number, user_pk, pns_pk, created_ts):
 
 
 @debugencode
-def export_electoral_register(pk, created_ts, voters, meeting_pk):
+def export_electoral_register(pk, created_ts, meeting_pk):
     return {
         'pk': pk,
         'model': 'poll.electoralregister',
         'fields': {
             'created': django_format_datetime(created_ts, force=True),
-            'voters': voters,
             'meeting': meeting_pk,
         },
     }
@@ -644,7 +699,7 @@ def export_speaker(pk, user_pk, speaker_list_pk, created_ts, seconds):
 
 
 @debugencode
-def export_speaker_list(pk, speaker_system_pk, agenda_item_pk, speakers, sl_title):
+def export_speaker_list(pk, speaker_system_pk, agenda_item_pk, sl_title):
     return {
         'pk': pk,
         'model': 'speaker.speakerlist',
@@ -653,7 +708,21 @@ def export_speaker_list(pk, speaker_system_pk, agenda_item_pk, speakers, sl_titl
             'state': 'closed',
             'speaker_system': speaker_system_pk,
             'agenda_item': agenda_item_pk,
-            'speakers': speakers  # list of speaker_pks
+        },
+    }
+
+
+@debugencode
+def export_meeting_roles(pk, entry, meeting_pk):
+    # No duplicates
+    assigned = set([role_map[x] for x in entry['groups'] if role_map[x]])
+    return {
+        'pk': pk,
+        'model': 'meeting.meetingroles',
+        'fields': {
+            'context': meeting_pk,
+            'user': get_pk_for_userid(entry['userid']),
+            'assigned': list(assigned),
         },
     }
 
@@ -680,6 +749,7 @@ def main():
 
     data = []
     data.append(export_root(root))
+    maybe_export_users = {}  # Userid to export
 
     print("Exporting %s users" % len(users))
     # Export users and map userids
@@ -687,9 +757,7 @@ def main():
     for user in users.values():
         userid_to_pk[user.userid] = user_pk
         user_pk_to_fullname[user_pk] = user.title
-        data.append(
-            export_user(user, user_pk)
-        )
+        maybe_export_users[user.userid] = export_user(user, user_pk)
         user_pk += 1
 
     # FIXME: Should we export admins too?
@@ -710,10 +778,21 @@ def main():
     speaker_system_pk = 1
     speaker_list_pk = 1
     speaker_pk = 1
+    meeting_roles_pk = 1
+
     meetings = [x for x in root.values() if x.type_name == 'Meeting']
     print("Exporting %s meetings" % len(meetings))
 
     for meeting_pk, meeting in enumerate(meetings, start=1):
+        # Limit to a single meeting?
+        if ONLY_MEETING_NAME:
+            if meeting.__name__ != ONLY_MEETING_NAME:
+               continue
+
+        # FIXME: Export other meetings than closed?
+        # if meeting.get_workflow_state() != 'closed':
+        #     add_error(meeting, 'Not closed')
+        #     continue
         data.append(
             export_meeting(meeting, meeting_pk)
         )
@@ -724,12 +803,29 @@ def main():
         userid_to_meeting_group_pk = {}
         for userid in meeting.system_userids:
             userid_to_meeting_group_pk[userid] = meeting_group_pk
+            needed_userids.add(userid)
             sys_user = users[userid]
             data.append(
                 export_meeting_group(sys_user, meeting_group_pk, meeting_pk)
             )
             # End meeting group loop
             meeting_group_pk += 1
+
+        # Export meeting roles
+        maybe_new_er_userids = set()  # In case there's no er, create one with these
+        for entry in meeting.get_security():
+            if entry['userid'].lower() != entry['userid']:
+                add_error(meeting, 'UserID with uppercase in get_security(): {userid}', userid=entry['userid'])
+            if not entry['userid']:
+                add_error(meeting, 'Empty userid in get_security()')
+                continue
+            data.append(
+                export_meeting_roles(meeting_roles_pk, entry, meeting_pk)
+            )
+            if ROLE_VOTER in entry['groups']:
+                maybe_new_er_userids.add(entry['userid'])
+            # End roles loop
+            meeting_roles_pk += 1
 
         # Export participant numbers
         pn_to_userid = {}
@@ -746,30 +842,55 @@ def main():
                     # The only fallback we have i guess
                     created_ts = meeting.created
                 data.append(
-                    export_pn(pn_pk, pn, userid_to_pk[userid], pn_system_pk, created_ts)
+                    export_pn(pn_pk, pn, get_pk_for_userid(userid), pn_system_pk, created_ts)
                 )
-                #End pn loop
+                # End pn loop
                 pn_pk += 1
             # End pn system
             pn_system_pk += 1
 
         # Electoral registers - might not exist
         electoral_registers = IElectoralRegister(meeting)
-        if len(electoral_registers.registers):
-            for num, register in electoral_registers.registers.items():
-                voters = []
-                for userid in register['userids']:
-                    data.append(
-                        export_voter_weight(voter_weight_pk, electoral_register_pk, userid_to_pk[userid])
-                    )
-                    voters.append(voter_weight_pk)
-                    # end voter weight loop
-                    voter_weight_pk += 1
-                data.append(
-                    export_electoral_register(electoral_register_pk, created_ts=register['time'], voters=voters, meeting_pk=meeting_pk)
+
+        exportable_ers = []
+        exportable_ers.extend(electoral_registers.registers.values())
+        # Maybe always export voters...?
+        if maybe_new_er_userids:
+            if exportable_ers:
+                # We may need to extend with current users if the existing er is wrong?
+                last_er = exportable_ers[-1]
+                if set(last_er['userids']) != maybe_new_er_userids:
+                    # We don't really have good data for this - but the newly created one must have the newest timestamp
+                    time_ts = last_er['time'] + timedelta(minutes=1)
+                    exportable_ers.append({'userids': list(maybe_new_er_userids), 'time': time_ts})
+            else:
+                # We have no clue about time but let's use the meeting start time?
+                # Make it look like an electoral register
+                time_ts = meeting.start_time
+                if not time_ts:
+                    # This may happen for meetings that haven't started
+                    time_ts = meeting.created
+                exportable_ers.append({'userids': list(maybe_new_er_userids), 'time': time_ts})
+
+        lastest_er_pk = None
+        for register in exportable_ers:
+            # Seems like ER needs to be first, so delay appending voterweight
+            er_voters_data = []
+            voters = []
+            for userid in register['userids']:
+                er_voters_data.append(
+                    export_voter_weight(voter_weight_pk, electoral_register_pk, get_pk_for_userid(userid))
                 )
-                # end er loop
-                electoral_register_pk += 1
+                voters.append(voter_weight_pk)
+                # end voter weight loop
+                voter_weight_pk += 1
+            data.append(
+                export_electoral_register(electoral_register_pk, created_ts=register['time'], meeting_pk=meeting_pk)
+            )
+            data.extend(er_voters_data)
+            lastest_er_pk = electoral_register_pk
+            # end er loop
+            electoral_register_pk += 1
 
         # Walk all AIs and meeting content
         for ai in meeting.values():
@@ -810,7 +931,7 @@ def main():
                 if author_userid in userid_to_meeting_group_pk:
                     kw = {'meeting_group_pk': userid_to_meeting_group_pk[author_userid]}
                 else:
-                    kw = {'author_pk': userid_to_pk[author_userid]}
+                    kw = {'author_pk': get_pk_for_userid(author_userid)}
                 data.append(
                     export_proposal(proposal, proposal_pk, ai_pk, **kw)
                 )
@@ -830,20 +951,20 @@ def main():
                 if author_userid in userid_to_meeting_group_pk:
                     kw = {'meeting_group_pk': userid_to_meeting_group_pk[author_userid]}
                 else:
-                    kw = {'author_pk': userid_to_pk[author_userid]}
+                    kw = {'author_pk': get_pk_for_userid(author_userid)}
                 data.append(
                     export_discussion_post(discussion_post, discussion_post_pk, ai_pk, **kw)
                 )
                 # End post loop
                 discussion_post_pk += 1
             for poll in items['Poll']:
-                out = export_poll(poll, poll_pk, meeting_pk, ai_pk)
+                out = export_poll(poll, poll_pk, meeting_pk, ai_pk, er_pk=lastest_er_pk)
                 if out:
                     data.append(out)
 
                     # And export votes
                     for vote in poll.values():
-                        out = export_vote(vote, vote_pk, poll_pk, userid_to_pk[vote.creator[0]])
+                        out = export_vote(vote, vote_pk, poll_pk, get_pk_for_userid(vote.creator[0]))
                         if out:
                             data.append(out)
                             # End vote loop
@@ -892,7 +1013,6 @@ def main():
                 if ai_uid not in ai_uid_to_pk:
                     # print("UID %s belongs to a deleted agenda item, won't export that speaker list" % ai_uid)
                     continue
-                speakers = []
                 for user_pn, spoken_times in sl.speaker_log.items():
                     if not spoken_times:
                         continue
@@ -902,13 +1022,13 @@ def main():
                     created_ts = sl.__parent__.modified
                     for seconds in spoken_times:
                         data.append(
-                            export_speaker(speaker_pk, userid_to_pk[pn_to_userid[user_pn]],
+                            export_speaker(speaker_pk, get_pk_for_userid(pn_to_userid[user_pn]),
                                            speaker_list_pk, created_ts, seconds)
                         )
                         # end speaker loop
                         speaker_pk += 1
                 data.append(
-                    export_speaker_list(speaker_list_pk, speaker_system_pk, ai_uid_to_pk[ai_uid], speakers, sl.title)
+                    export_speaker_list(speaker_list_pk, speaker_system_pk, ai_uid_to_pk[ai_uid], sl.title)
                 )
                 # End speaker list loop
                 speaker_list_pk += 1
@@ -916,10 +1036,22 @@ def main():
             # END speaker system block
             speaker_system_pk += 1
 
-        # FIXME  Röster
-        # FIXME: Röster som är duplicerade?
-        # FIXME: presence ?
-        # FIXME: Exporten av resultatdata för schulze använder ranking istället för rating, så vi måste vända på siffrorna!
+    # Append users we care about
+    skipped = 0
+    for userid, usr_data in maybe_export_users.items():
+        if userid in needed_userids:
+            data.insert(0, usr_data)
+        else:
+            skipped += 1
+    if skipped:
+        print("Maybe we can skip export of %s users" % skipped)
+
+
+    # FIXME: Röster som är duplicerade?
+    # FIXME: presence ?
+    # FIXME: Exporten av resultatdata för schulze använder ranking istället för rating, så vi måste vända på siffrorna!
+    # FIXME: Vad gör vi med ballot_data för historiska omröstningar?
+    # FIXME: Gilla-knappar blir problematiskt med tanke på ContentTypes i django - natural key?
 
     if errors:
         print("-"*80)
