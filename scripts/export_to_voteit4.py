@@ -12,9 +12,11 @@ from uuid import uuid4
 
 from pyramid.paster import bootstrap
 from pyramid.traversal import resource_path
+from pyramid.traversal import find_interface
 from voteit.core.helpers import AT_PATTERN
 from voteit.core.helpers import TAG_PATTERN
 from voteit.core.models.interfaces import IDiffText
+from voteit.core.models.interfaces import IMeeting
 from voteit.core.models.interfaces import IMentioned
 from voteit.core.security import ROLE_ADMIN
 from voteit.core.security import ROLE_DISCUSS
@@ -279,8 +281,24 @@ def reformat_schulze_round(result):
         result['tied_winners'] = [proposal_uid_to_pk[x] for x in result['tied_winners']]
 
 
+def get_proposal_with_check(referencing_obj, uid, request):
+    meeting = find_interface(referencing_obj, IMeeting)
+    prop = request.resolve_uid(uid, perm=None)
+    maybe_other_meeting = find_interface(prop, IMeeting)
+    if maybe_other_meeting != meeting:
+        raise Exception("{referencing_obj}: Must skip export: Proposal from another meeting: {meeting}".format(
+            referencing_obj=resource_path(referencing_obj), meeting=resource_path(maybe_other_meeting))
+        )
+        # add_error(referencing_obj, "Must skip export: Proposal from another meeting: {meeting}",
+        #           meeting=resource_path(maybe_other_meeting))
+
+        # add_error(referencing_obj, "Must skip export: Proposal from another meeting: {meeting}",
+        #           meeting=resource_path(maybe_other_meeting))
+        # return
+    return proposal_uid_to_pk[uid]
+
 @debugencode
-def export_poll(poll, pk, meeting_pk, ai_pk, er_pk=None):
+def export_poll(poll, pk, meeting_pk, ai_pk, request, er_pk=None):
     state = poll.get_workflow_state()
     is_closed = state == 'closed'
     is_ongoing = state == 'ongoing'
@@ -292,17 +310,17 @@ def export_poll(poll, pk, meeting_pk, ai_pk, er_pk=None):
     if not poll.poll_result and is_closed:
         add_error(poll, 'Skipping poll without result data:\n{res}', res=poll.poll_result)
         return
+    # Make sure there are no cross-linked proposals!
     proposals = []
     for uid in poll.proposals:
         try:
-            proposals.append(proposal_uid_to_pk[uid])
+            proposals.append(get_proposal_with_check(poll, uid, request))
         except KeyError:
             # Are we okay with skipping?
             add_error(poll, "Must skip export: Poll in state {state} contains deleted proposal uid: {uid}", state=state, uid=uid)
             return
     settings = dict(poll.poll_settings)
     poll_plugin = poll.poll_plugin
-
     result = None
     if is_closed:
         if poll_plugin not in ('dutt_poll', 'majority_poll'):
@@ -325,21 +343,26 @@ def export_poll(poll, pk, meeting_pk, ai_pk, er_pk=None):
     # Change result format to match V4
     if is_closed:
         if poll_plugin == 'schulze_pr':
-            result['candidates'] = [proposal_uid_to_pk[x] for x in result['candidates']]
-            result['order'] = [proposal_uid_to_pk[x] for x in result['order']]
-            result['rounds'] = [{'winner': proposal_uid_to_pk[x['winner']]} for x in result['rounds']]
+            result['candidates'] = [get_proposal_with_check(poll, x, request) for x in result['candidates']]
+            result['order'] = [get_proposal_with_check(poll, x, request) for x in result['order']]
+            result['rounds'] = [{'winner': get_proposal_with_check(poll, x['winner'], request)} for x in result['rounds']]
         elif poll_plugin == 'schulze':
             if 'winner' not in result:
                 add_error(poll, "No winner in result data, skipping")
                 return
             reformat_schulze_round(result)
+            result['approved'] = [result['winner']]
+            result['denied'] = list(set(result['candidates']) - set(result['approved']))
         elif poll_plugin == 'sorted_schulze':
             if 'winners' not in result:
                 add_error(poll, "No winners in result data, skipping")
                 return
+            result['candidates'] = [get_proposal_with_check(poll, x, request) for x in result['candidates']]
+            if settings.get('winners', None) is not None:
+                result['approved'] = [get_proposal_with_check(poll, x, request) for x in result['winners']]
+                result['denied'] = list(set(result['candidates']) - set(result['approved']))
             # Winners aren't part of the new style results
-            result['winners'].pop()
-            result['candidates'] = [proposal_uid_to_pk[x] for x in result['candidates']]
+            del result['winners']
             for round in result['rounds']:
                 # Modified in place
                 reformat_schulze_round(round)
@@ -352,23 +375,25 @@ def export_poll(poll, pk, meeting_pk, ai_pk, er_pk=None):
         #     tied_winners: Optional[List[int]]
         elif poll_plugin == 'schulze_stv':
             if 'tie_breaker' in result:
-                result['tie_breaker'] = [proposal_uid_to_pk[x] for x in result['tie_breaker']]
+                result['tie_breaker'] = [get_proposal_with_check(poll, x, request) for x in result['tie_breaker']]
             if 'tied_winners' in result:
                 tied = []
                 for row in result['tied_winners']:
                     # Is this the correct format? :)
-                    tied.extend([proposal_uid_to_pk[x] for x in row])
+                    tied.extend([get_proposal_with_check(poll, x, request) for x in row])
                 result['tied_winners'] = tied
-            result['candidates'] = [proposal_uid_to_pk[x] for x in result['candidates']]
+            result['candidates'] = [get_proposal_with_check(poll, x, request) for x in result['candidates']]
             if 'winners' not in result:
                 add_error(poll, "No winners in result data, skipping")
                 return
-            result['winners'] = [proposal_uid_to_pk[x] for x in result['winners']]
+            result['winners'] = result['approved'] = [get_proposal_with_check(poll, x, request) for x in result['winners']]
             # Let's not care about the other parts
             result.pop('actions', None)
+            result['denied'] = list(set(result['candidates']) - set(result['winners']))
         elif poll_plugin == 'scottish_stv':
-            result['winners'] = [proposal_uid_to_pk[x] for x in result['winners']]
-            result['candidates'] = [proposal_uid_to_pk[x] for x in result['candidates']]
+            result['winners'] = result['approved'] = [get_proposal_with_check(poll, x, request) for x in result['winners']]
+            result['candidates'] = [get_proposal_with_check(poll, x, request) for x in result['candidates']]
+            result['denied'] = list(set(result['candidates']) - set(result['approved']))
             rounds = []
             for round_data in result['rounds']:
                 # Expects:
@@ -379,12 +404,12 @@ def export_poll(poll, pk, meeting_pk, ai_pk, er_pk=None):
                 #     vote_count: List[Tuple[int, Decimal]]
                 round = {}
                 round.update(round_data)
-                round['selected'] = [proposal_uid_to_pk[x] for x in round_data['selected']]
+                round['selected'] = [get_proposal_with_check(poll, x, request) for x in round_data['selected']]
                 round['vote_count'] = []
                 for x in round_data['vote_count']:
                     # A dict
                     for k, v in x.items():
-                        round['vote_count'].append([proposal_uid_to_pk[k], str(v)])
+                        round['vote_count'].append([get_proposal_with_check(poll, k, request), str(v)])
                 rounds.append(round)
             result['rounds'] = rounds
             # {u'complete': False, u'quota': 1, u'randomized': False, u'winners': (u'cf555e02-dab9-4520-84fe-6fe3da786105',),
@@ -396,11 +421,19 @@ def export_poll(poll, pk, meeting_pk, ai_pk, er_pk=None):
             #  u'selected': (u'cf555e02-dab9-4520-84fe-6fe3da786105',), u'method': u'Direct'},), u'empty_ballot_count': 0}
         elif poll_plugin == 'combined_simple':
             reformed_result = {}
+            approved = []
+            denied = []
             for k, res in result.items():
-                reformed_result[proposal_uid_to_pk[k]] = {'yes': res['approve'],
+                reformed_result[get_proposal_with_check(poll, k, request)] = {'yes': res['approve'],
                                                           'no': res['deny'],
                                                           'abstain': res['abstain']}
-            result = {'results': reformed_result}
+                # Only clear results!
+                # No need to double-check here
+                if res['approve'] > res['deny']:
+                    approved.append(proposal_uid_to_pk[k])
+                elif res['deny'] > res['approve'] :
+                    denied.append(proposal_uid_to_pk[k])
+            result = {'results': reformed_result, 'approved': approved, 'denied': denied}
         elif poll_plugin == 'dutt_poll':
             # [{'num': 4, 'percent': u'57.1%', 'uid': u'f9635154-68f5-4a17-9940-59a179af6a49'},
             #  {'num': 4, 'percent': u'57.1%', 'uid': u'8bfcf698-92e8-4921-bb68-24f13fdd116e'},
@@ -412,7 +445,7 @@ def export_poll(poll, pk, meeting_pk, ai_pk, er_pk=None):
             reformatted_results = []
             for item in poll.poll_result:
                 reformatted_results.append(
-                    {'votes': item['num'], 'proposal': proposal_uid_to_pk[item['uid']]}
+                    {'votes': item['num'], 'proposal': get_proposal_with_check(poll, item['uid'], request)}
                 )
             result = {'results': reformatted_results}
         elif poll_plugin == 'majority_poll':
@@ -424,12 +457,18 @@ def export_poll(poll, pk, meeting_pk, ai_pk, er_pk=None):
             reformatted_results = []
             for item in poll.poll_result:
                 reformatted_results.append(
-                    {'votes': item['count'], 'proposal':  proposal_uid_to_pk[item['uid']['proposal']]}
+                    {'votes': item['count'],
+                     'proposal': get_proposal_with_check(poll, item['uid']['proposal'], request)}
                 )
+            reformatted_results.sort(key=lambda x: x['votes'])
             result = {'results': reformatted_results}
+            if len(reformatted_results) > 1:
+                if reformatted_results[0]["votes"] != reformatted_results[1]["votes"]:
+                    result['approved'] = [reformatted_results[0]['proposal']]
+                    result['denied'] = [x['proposal'] for x in reformatted_results[1:]]
+            if len(reformatted_results) == 1:  # Don't ask...
+                result['approved'] = [reformatted_results[0]['proposal']]
 
-        # result['approved'] = xxx
-        # result['denied'] = xxx
         result['vote_count'] = len(poll)
 
     data = {
@@ -442,7 +481,7 @@ def export_poll(poll, pk, meeting_pk, ai_pk, er_pk=None):
             'started': django_format_datetime(poll.start_time),
             'closed': django_format_datetime(poll.end_time),
             'body': poll.description,
-            'state': state,
+            'state': is_closed and 'finished' or state,
             'meeting': meeting_pk,
             'agenda_item': ai_pk,
             'method_name': poll_method_mapping[poll_plugin],
@@ -976,7 +1015,7 @@ def main():
                 # End post loop
                 discussion_post_pk += 1
             for poll in items['Poll']:
-                out = export_poll(poll, poll_pk, meeting_pk, ai_pk, er_pk=lastest_er_pk)
+                out = export_poll(poll, poll_pk, meeting_pk, ai_pk, request, er_pk=lastest_er_pk)
                 if out:
                     data.append(out)
 
