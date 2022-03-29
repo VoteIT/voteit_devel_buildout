@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from __future__ import unicode_literals
 
 import argparse
@@ -140,13 +141,18 @@ def text_to_v4_hashtag(text):
 def text_to_v4_mention(text):
 
     def handle_match(matchobj):
-        # The pattern contains a space so we only find usernames that
-        # has a whitespace in front, we save the spaced so we can but
+        # The pattern contains a space, we only find usernames that
+        # has a whitespace in front, we save the space so we can put
         # it back after the transformation
         # space, userid = matchobj.group(1, 2)
         userid = matchobj.group(2)
         userid = userid.lower()
-        return " %s" % mk_v4_usertag( get_pk_for_userid(userid))
+        try:
+            user_pk = get_pk_for_userid(userid)
+        except KeyError:
+            # Mentioned user may have been deleted
+            return " %s" % userid
+        return " %s" % mk_v4_usertag(user_pk)
 
     return re.sub(AT_PATTERN, handle_match, text)
 
@@ -284,14 +290,16 @@ def export_poll(poll, pk, meeting_pk, ai_pk, er_pk=None):
         add_error(poll, 'Poll open without er, aborting export')
         return
     if not poll.poll_result and is_closed:
-        add_error(poll, 'No result data:\n{res}', res=poll.poll_result)
+        add_error(poll, 'Skipping poll without result data:\n{res}', res=poll.poll_result)
         return
     proposals = []
     for uid in poll.proposals:
         try:
             proposals.append(proposal_uid_to_pk[uid])
         except KeyError:
-            import pdb;pdb.set_trace()
+            # Are we okay with skipping?
+            add_error(poll, "Must skip export: Poll in state {state} contains deleted proposal uid: {uid}", state=state, uid=uid)
+            return
     settings = dict(poll.poll_settings)
     poll_plugin = poll.poll_plugin
 
@@ -716,12 +724,16 @@ def export_speaker_list(pk, speaker_system_pk, agenda_item_pk, sl_title):
 def export_meeting_roles(pk, entry, meeting_pk):
     # No duplicates
     assigned = set([role_map[x] for x in entry['groups'] if role_map[x]])
+    try:
+        user_pk = get_pk_for_userid(entry['userid'])
+    except KeyError:
+        return
     return {
         'pk': pk,
         'model': 'meeting.meetingroles',
         'fields': {
             'context': meeting_pk,
-            'user': get_pk_for_userid(entry['userid']),
+            'user': user_pk,
             'assigned': list(assigned),
         },
     }
@@ -731,10 +743,7 @@ def django_format_datetime(dt, force=False):
     if force and not isinstance(dt, datetime):
         raise ValueError("%s is not a datetime instance" % dt)
     if dt is not None:
-        out = dt.isoformat()
-        if out.endswith('+00:00'):
-            out = out[:-6] + 'Z'
-        return out
+        return dt.isoformat()
 
 
 def main():
@@ -782,13 +791,14 @@ def main():
 
     meetings = [x for x in root.values() if x.type_name == 'Meeting']
     print("Exporting %s meetings" % len(meetings))
-
     for meeting_pk, meeting in enumerate(meetings, start=1):
         # Limit to a single meeting?
         if ONLY_MEETING_NAME:
             if meeting.__name__ != ONLY_MEETING_NAME:
                continue
-
+            print("WARNING: Only exporting meeting with name %s" % ONLY_MEETING_NAME)
+        else:
+            print("Exporting: %s" % meeting.__name__)
         # FIXME: Export other meetings than closed?
         # if meeting.get_workflow_state() != 'closed':
         #     add_error(meeting, 'Not closed')
@@ -819,28 +829,36 @@ def main():
             if not entry['userid']:
                 add_error(meeting, 'Empty userid in get_security()')
                 continue
-            data.append(
-                export_meeting_roles(meeting_roles_pk, entry, meeting_pk)
-            )
-            if ROLE_VOTER in entry['groups']:
-                maybe_new_er_userids.add(entry['userid'])
-            # End roles loop
-            meeting_roles_pk += 1
+            out = export_meeting_roles(meeting_roles_pk, entry, meeting_pk)
+            if out:
+                data.append(out)
+                if ROLE_VOTER in entry['groups']:
+                    maybe_new_er_userids.add(entry['userid'])
+                # End roles loop
+                meeting_roles_pk += 1
+            else:
+                add_error(meeting, 'Skipping meeting roles assigned to non-existing user: {userid}', userid=entry['userid'])
 
         # Export participant numbers
         pn_to_userid = {}
+
         pns = IParticipantNumbers(meeting)
         if len(pns.number_to_userid):
             pn_to_userid.update(pns.number_to_userid)
             data.append(
                 export_pn_system(pn_system_pk, meeting_pk)
             )
+            assigned_userids = set()
             for pn, userid in pn_to_userid.items():
                 try:
                     created_ts = pns[pn].created
                 except (KeyError, AttributeError):
                     # The only fallback we have i guess
                     created_ts = meeting.created
+                if userid in assigned_userids:
+                    add_error(meeting, "WARNING: {userid} has several participant numbers. Export won't work!", userid=userid)
+                    continue
+                assigned_userids.add(userid)
                 data.append(
                     export_pn(pn_pk, pn, get_pk_for_userid(userid), pn_system_pk, created_ts)
                 )
@@ -979,6 +997,7 @@ def main():
         # Speaker lists - we can only export one speaker list system since we don't know about relations to
         # categories for voteit3
         sls = speaker_lists(request, meeting)
+
         if len(sls.data):
             # System has lists
             # Schema and settings lookup doesn't seem to work as it should
@@ -1067,6 +1086,7 @@ def main():
         print("Everything worked as expected!")
 
     filename = 'voteit4_export.json'
+    print("Writing %s" % filename)
     with open(filename, "w") as stream:
         dump(data, stream)
 
