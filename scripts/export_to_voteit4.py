@@ -48,6 +48,7 @@ needed_userids = set()
 
 errors = {}
 unique_errors = set()
+critical_errors = set()
 emails = set()
 
 
@@ -82,7 +83,10 @@ role_map = {
 }
 
 
-def add_error(obj, msg, **kwargs):
+def add_error(obj, msg, critical=False, **kwargs):
+    if critical:
+        critical_errors.add(msg)
+        msg = "CRIT: " + msg
     if SINGLE_ERROR and msg in unique_errors:
         return
     errs = errors.setdefault(resource_path(obj), [])
@@ -286,15 +290,8 @@ def get_proposal_with_check(referencing_obj, uid, request):
     prop = request.resolve_uid(uid, perm=None)
     maybe_other_meeting = find_interface(prop, IMeeting)
     if maybe_other_meeting != meeting:
-        raise Exception("{referencing_obj}: Must skip export: Proposal from another meeting: {meeting}".format(
-            referencing_obj=resource_path(referencing_obj), meeting=resource_path(maybe_other_meeting))
-        )
-        # add_error(referencing_obj, "Must skip export: Proposal from another meeting: {meeting}",
-        #           meeting=resource_path(maybe_other_meeting))
-
-        # add_error(referencing_obj, "Must skip export: Proposal from another meeting: {meeting}",
-        #           meeting=resource_path(maybe_other_meeting))
-        # return
+        add_error(referencing_obj, "Must skip export: Proposal from another meeting: {meeting}", critical=True,
+                  meeting=resource_path(maybe_other_meeting))
     return proposal_uid_to_pk[uid]
 
 @debugencode
@@ -330,6 +327,7 @@ def export_poll(poll, pk, meeting_pk, ai_pk, request, er_pk=None):
                 add_error(poll, "Result data isn't a dict, skipping")
                 return
 
+    # Adjust settings and maybe model
     if poll_plugin == 'sorted_schulze':
         winners = settings.get('winners', None)
         if winners == 0:
@@ -339,6 +337,12 @@ def export_poll(poll, pk, meeting_pk, ai_pk, request, er_pk=None):
             poll_plugin = 'schulze'
             if is_closed:
                 result = result['rounds'][0]
+    elif poll_plugin == 'scottish_stv':
+        winners = settings.get('winners', None)
+        if winners is None:
+            # So this setting is invalid, but 1 will be default in voteit. So if there's no data, we can just assume 1.
+            add_error(poll, "Missing settings for Scottish STV, setting winners to 1. Will export")
+            settings['winners'] = 1
 
     # Change result format to match V4
     if is_closed:
@@ -547,9 +551,13 @@ def export_vote(vote, pk, poll_pk, user_pk):
                 raise ValueError("Corrupt data within vote_data: %s" % orig_vote_data)
         vote_data = dumps(data)
     elif poll.poll_plugin == 'dutt_poll':
-        vote_data = dumps({'choices': sorted([proposal_uid_to_pk[x] for x in orig_vote_data['proposals']])})
+        vote_data = dumps(sorted([proposal_uid_to_pk[x] for x in orig_vote_data['proposals']]))
+        # Malformed previous export data:
+        # vote_data = dumps({'choices': sorted([proposal_uid_to_pk[x] for x in orig_vote_data['proposals']])})
     elif poll.poll_plugin == 'scottish_stv':
-        vote_data = dumps({'ranking': [proposal_uid_to_pk[x] for x in orig_vote_data['proposals']]})
+        vote_data = ",".join([str(proposal_uid_to_pk[x]) for x in orig_vote_data['proposals']])
+        # Malformed previous export data:
+        # vote_data = dumps({'ranking': [proposal_uid_to_pk[x] for x in orig_vote_data['proposals']]})
     else:
         print("Vote data for %s:" % poll.poll_plugin)
         print(vote.get_vote_data())
@@ -1123,7 +1131,8 @@ def main():
             print("!!! NOTE !!! Errors were omitted, unset SINGLE_ERROR to display all")
     else:
         print("Everything worked as expected!")
-
+    if critical_errors:
+        sys.exit("!!! %s critical errors - won't write!" % len(critical_errors))
     filename = 'voteit4_export.json'
     print("Writing %s" % filename)
     with open(filename, "w") as stream:
