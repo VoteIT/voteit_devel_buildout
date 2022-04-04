@@ -202,9 +202,10 @@ def export_user(user, pk):
         'fields': {
             'first_name': user.first_name,
             'last_name': user.last_name,
-            'date_joined': django_format_datetime( user.created),
+            'date_joined': django_format_datetime(user.created),
+            'last_login': django_format_datetime(user.modified),
             'email': email,
-            'organisation': 1,  #Will be remapped
+            'organisation': 1,  # Will be remapped
             'userid': user.userid,
             'username': str(uuid4()),
         }
