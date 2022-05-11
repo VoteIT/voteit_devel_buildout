@@ -35,6 +35,7 @@ from voteit.irl.models.interfaces import IParticipantNumbers
 SINGLE_ERROR = False
 ONLY_MEETING_NAME = None
 REPORT_NOT_CLOSED = False
+REPORT_TRUNCATED_TAGS_AS_ERROR = False
 
 userid_to_pk = {}
 user_pk_to_fullname = {}
@@ -45,6 +46,7 @@ proposal_uid_to_pk = {}
 # key like f"{ai_pk}:{paragraph}"
 diff_text_ai_pk_and_paragraph_to_pk = {}
 needed_userids = set()
+long_tag_to_trunc = {}
 
 errors = {}
 unique_errors = set()
@@ -57,8 +59,55 @@ def get_pk_for_userid(userid):
     return userid_to_pk[userid]
 
 
+def truncate_tag(tag):
+    """
+    something like: 21-c-val-av-riksforbundets-styrelse-ordinarie-ledamoter-3
+    """
+    items = tag.split("-")
+    num = items[-1]
+    text = "-".join(items[:-1])
+    new_tag = text[:49-len(num)] + "-" + num
+    long_tag_to_trunc[tag] = new_tag
+    return new_tag
+
+
+def adjust_object_richtext_tags(obj):
+    """
+    Takes a proposal or a discussion post and replaces the tag in the text body and in tags.
+    Adjust object in place since we won't save anything anyway.
+    """
+    tags_to_adjust = set()
+    if obj.type_name == 'Proposal':
+        if len(obj.aid) > 50:
+            if REPORT_TRUNCATED_TAGS_AS_ERROR:
+                add_error(obj, "AID tag too long, will be truncated: {tag}", tag=obj.aid)
+            obj.aid = truncate_tag(obj.aid)
+            tags_to_adjust.add(obj.aid)
+    for tag in obj.tags:  # new copy!
+        if len(tag) > 50:
+            truncate_tag(tag)
+            if REPORT_TRUNCATED_TAGS_AS_ERROR:
+                add_error(obj, "Tag too long: {tag}", tag=tag)
+            tags_to_adjust.add(tag)
+    # Silly version of replace i guess
+    if tags_to_adjust:
+        out = []
+        for item in obj.text.split(" "):
+            # Hash sign first
+            tag = item[1:]
+            if tag in tags_to_adjust:
+                out.append("#" + long_tag_to_trunc[tag])
+            else:
+                out.append(item)
+        # print("ORIG TEXT:")
+        # print(obj.text)
+        obj.text = " ".join(out)
+        # print("NEW TEXT:")
+        # print(obj.text)
+        # print("-"*80)
+    return obj
+
 # VoteIT3 as key
-# FIXME:
 poll_method_mapping = {
     'schulze': 'schulze',
     'scottish_stv': 'scottish_stv',
@@ -344,6 +393,12 @@ def export_poll(poll, pk, meeting_pk, ai_pk, request, er_pk=None):
             # So this setting is invalid, but 1 will be default in voteit. So if there's no data, we can just assume 1.
             add_error(poll, "Missing settings for Scottish STV, setting winners to 1. Will export")
             settings['winners'] = 1
+    elif poll_plugin == 'dutt_poll':
+        max_choices = settings.get('max', 0)
+        min_choices = settings.get('min', 0)
+        if max_choices < min_choices:
+            add_error(poll, "Dutt poll with lower max than min. Raised max to {num}", num=min_choices)
+            settings['max'] = min_choices
 
     # Change result format to match V4
     if is_closed:
@@ -417,6 +472,8 @@ def export_poll(poll, pk, meeting_pk, ai_pk, request, er_pk=None):
                         round['vote_count'].append([get_proposal_with_check(poll, k, request), str(v)])
                 rounds.append(round)
             result['rounds'] = rounds
+            # Must exist!
+            result.setdefault('empty_ballot_count', 0)
             # {u'complete': False, u'quota': 1, u'randomized': False, u'winners': (u'cf555e02-dab9-4520-84fe-6fe3da786105',),
             #  u'candidates': (u'9a532d8c-ea42-496c-9eb2-e61a504381bd', u'e60f4303-d163-406c-9357-8a5bdfa2c7ed',
             #                  u'cf555e02-dab9-4520-84fe-6fe3da786105'), u'runtime': 0.0009920597076416016, u'rounds': (
@@ -579,6 +636,7 @@ def export_vote(vote, pk, poll_pk, user_pk):
 @debugencode
 def export_proposal(proposal, pk, ai_pk, author_pk=None, meeting_group_pk=None):
     assert bool(author_pk) != bool(meeting_group_pk)
+    adjust_object_richtext_tags(proposal)
     body = convert_richtext_body(proposal.text)
     data = {
         'pk': pk,
@@ -617,6 +675,7 @@ def export_diff_proposal(pk, diff_text_para, ai_pk):
 @debugencode
 def export_discussion_post(discussion_post, pk, ai_pk, author_pk = None, meeting_group_pk = None):
     assert bool(author_pk) != bool(meeting_group_pk)
+    adjust_object_richtext_tags(discussion_post)
     body = convert_richtext_body(discussion_post.text)
     data = {
         'pk': pk,
@@ -847,10 +906,6 @@ def main():
             print("WARNING: Only exporting meeting with name %s" % ONLY_MEETING_NAME)
         else:
             print("Exporting: %s" % meeting.__name__)
-        # FIXME: Export other meetings than closed?
-        # if meeting.get_workflow_state() != 'closed':
-        #     add_error(meeting, 'Not closed')
-        #     continue
         data.append(
             export_meeting(meeting, meeting_pk)
         )
@@ -1119,6 +1174,12 @@ def main():
     # FIXME: Exporten av resultatdata för schulze använder ranking istället för rating, så vi måste vända på siffrorna!
     # FIXME: Vad gör vi med ballot_data för historiska omröstningar?
     # FIXME: Gilla-knappar blir problematiskt med tanke på ContentTypes i django - natural key?
+
+    if not critical_errors and long_tag_to_trunc:
+        print("The following tags are too long and need to be adjusted:")
+        print("-"*40)
+        for longtag,truncated in long_tag_to_trunc.items():
+            print(truncated.ljust(53) + "->  " + longtag)
 
     if errors:
         print("-"*80)
