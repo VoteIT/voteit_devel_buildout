@@ -30,7 +30,7 @@ from voteit.debate.interfaces import ISpeakerListSettings
 from voteit.debate.models import speaker_lists
 from voteit.irl.models.interfaces import IElectoralRegister
 from voteit.irl.models.interfaces import IParticipantNumbers
-
+from voteit.multiple_votes import MEETING_NAMESPACE
 # Settings
 SINGLE_ERROR = False
 ONLY_MEETING_NAME = None
@@ -54,10 +54,17 @@ critical_errors = set()
 emails = set()
 
 
-def get_pk_for_userid(userid):
+def get_pk_for_userid(userid, context=None, msg=None):
     needed_userids.add(userid)
-    return userid_to_pk[userid]
-
+    try:
+        return userid_to_pk[userid]
+    except KeyError:
+        if context:
+            if msg is None:
+                msg="Missing user '{userid}'"
+            add_error(context, msg,userid=userid, critical=True)
+        else:
+            raise
 
 def truncate_tag(tag):
     """
@@ -649,7 +656,7 @@ def export_proposal(proposal, pk, ai_pk, author_pk=None, meeting_group_pk=None):
             'prop_id': proposal.aid,
             'agenda_item': ai_pk,
             'tags': proposal.tags,
-            'mentions': [get_pk_for_userid(x) for x in IMentioned(proposal).keys()]
+            'mentions': [get_pk_for_userid(x, context=proposal, msg="Missing user '{userid}' in mentions") for x in IMentioned(proposal).keys()]
         },
     }
     if author_pk:
@@ -685,7 +692,7 @@ def export_discussion_post(discussion_post, pk, ai_pk, author_pk = None, meeting
             'created': django_format_datetime(discussion_post.created),
             'body': body,
             'tags': discussion_post.tags,
-            'mentions': [get_pk_for_userid(x) for x in IMentioned(discussion_post).keys()],
+            'mentions': [get_pk_for_userid(x, context=discussion_post, msg="Missing user '{userid}' in mentions") for x in IMentioned(discussion_post).keys()],
             'agenda_item': ai_pk,
         },
     }
@@ -906,6 +913,10 @@ def main():
             print("WARNING: Only exporting meeting with name %s" % ONLY_MEETING_NAME)
         else:
             print("Exporting: %s" % meeting.__name__)
+
+        if MEETING_NAMESPACE in meeting:
+            add_error(meeting, "Multi-votes activated, adjust export", critical=True)
+
         data.append(
             export_meeting(meeting, meeting_pk)
         )
@@ -963,7 +974,7 @@ def main():
                     continue
                 assigned_userids.add(userid)
                 data.append(
-                    export_pn(pn_pk, pn, get_pk_for_userid(userid), pn_system_pk, created_ts)
+                    export_pn(pn_pk, pn, get_pk_for_userid(userid, context=meeting, msg="Missing user '{userid}' in PNS"), pn_system_pk, created_ts)
                 )
                 # End pn loop
                 pn_pk += 1
@@ -1000,7 +1011,8 @@ def main():
             voters = []
             for userid in register['userids']:
                 er_voters_data.append(
-                    export_voter_weight(voter_weight_pk, electoral_register_pk, get_pk_for_userid(userid))
+                    export_voter_weight(voter_weight_pk, electoral_register_pk,
+                                        get_pk_for_userid(userid, context=meeting, msg="Missing user '{userid}' in ER"))
                 )
                 voters.append(voter_weight_pk)
                 # end voter weight loop
@@ -1052,7 +1064,7 @@ def main():
                 if author_userid in userid_to_meeting_group_pk:
                     kw = {'meeting_group_pk': userid_to_meeting_group_pk[author_userid]}
                 else:
-                    kw = {'author_pk': get_pk_for_userid(author_userid)}
+                    kw = {'author_pk': get_pk_for_userid(author_userid, context=proposal)}
                 data.append(
                     export_proposal(proposal, proposal_pk, ai_pk, **kw)
                 )
@@ -1072,7 +1084,7 @@ def main():
                 if author_userid in userid_to_meeting_group_pk:
                     kw = {'meeting_group_pk': userid_to_meeting_group_pk[author_userid]}
                 else:
-                    kw = {'author_pk': get_pk_for_userid(author_userid)}
+                    kw = {'author_pk': get_pk_for_userid(author_userid, context=discussion_post)}
                 data.append(
                     export_discussion_post(discussion_post, discussion_post_pk, ai_pk, **kw)
                 )
@@ -1085,7 +1097,7 @@ def main():
 
                     # And export votes
                     for vote in poll.values():
-                        out = export_vote(vote, vote_pk, poll_pk, get_pk_for_userid(vote.creator[0]))
+                        out = export_vote(vote, vote_pk, poll_pk, get_pk_for_userid(vote.creator[0], context=vote))
                         if out:
                             data.append(out)
                             # End vote loop
