@@ -10,7 +10,9 @@ from json import dump
 from json import dumps
 from uuid import uuid4
 
+from arche_usertags.interfaces import IUserTags
 from pyramid.paster import bootstrap
+from pyramid.threadlocal import get_current_registry
 from pyramid.traversal import resource_path
 from pyramid.traversal import find_interface
 from voteit.core.helpers import AT_PATTERN
@@ -136,6 +138,13 @@ role_map = {
     ROLE_ADMIN: '',
     ROLE_MEETING_CREATOR: '',
     ROLE_OWNER: '',
+}
+
+
+model_map = {
+    'DiscussionPost': 'discussion_post',
+    'Meeting': 'meeting',
+    'Proposal': 'proposal',
 }
 
 
@@ -837,18 +846,82 @@ def export_speaker_list(pk, speaker_system_pk, agenda_item_pk, sl_title):
 @debugencode
 def export_meeting_roles(pk, entry, meeting_pk):
     # No duplicates
-    assigned = set([role_map[x] for x in entry['groups'] if role_map[x]])
     try:
         user_pk = get_pk_for_userid(entry['userid'])
     except KeyError:
         return
+    assigned = set([role_map[x] for x in entry['groups'] if role_map[x]])
+    if 'moderator' in assigned:
+        assigned.add('participant')
     return {
         'pk': pk,
         'model': 'meeting.meetingroles',
         'fields': {
             'context': meeting_pk,
             'user': user_pk,
-            'assigned': list(assigned),
+            'assigned': sorted(assigned),
+        },
+    }
+
+
+
+@debugencode
+def export_reaction_button(pk, meeting, meeting_pk, title="Gilla", icon='mdi-thumb-up', color='primary'):
+    """
+    The v4 object that holds the information for reactions. We'll mostly create "like"-buttons
+    """
+    # Should be: ["proposal", "discussion_post"]
+    allowed_models = [model_map[x] for x in getattr(meeting, 'like_context_types', [])]
+    # This isn't strictly correct since disabled in old system means allowed. But the button is disabled anyway,
+    # so it might be a good idea to look at this regardless
+    change_roles = [role_map[x] for x in getattr(meeting, 'like_user_roles', [])]
+    list_roles = ['participant']
+    return {
+        'pk': pk,
+        'model': 'reactions.reactionbutton',
+        'fields': {
+            'title': title,
+            'icon': icon,
+            'color': color,
+            'meeting': meeting_pk,
+            'change_roles': change_roles,
+            'list_roles': list_roles,
+            'active': False,
+            'allowed_models': allowed_models,
+        },
+    }
+
+
+@debugencode
+def export_reaction(pk, context, object_id, button_pk, ai_pk, userid):
+    """
+    :param pk: reactions pk
+    :param context: what's reacted on
+    :param object_id: The proposal or discussion post pk
+    :param button_pk:
+    :param ai_pk:
+    :param userid:
+    :return: maybe return data if there are reactions
+
+    A specific users click on a like-button or similar
+    """
+
+    if context.type_name == 'Proposal':
+        content_type = ["proposal", "proposal"]
+    elif context.type_name == 'DiscussionPost':
+        content_type = ["discussion", "discussionpost"]
+    else:
+        raise ValueError("Wrong context: %s" % context)
+
+    return {
+        'pk': pk,
+        'model': 'reactions.reaction',
+        'fields': {
+            "content_type":content_type,
+            'object_id': object_id,
+            'button': button_pk,
+            'user': get_pk_for_userid(userid, context=context),
+            'agenda_item': ai_pk,
         },
     }
 
@@ -902,6 +975,8 @@ def main():
     speaker_list_pk = 1
     speaker_pk = 1
     meeting_roles_pk = 1
+    reaction_button_pk = 1
+    reaction_pk = 1
 
     meetings = [x for x in root.values() if x.type_name == 'Meeting']
     print("Exporting %s meetings" % len(meetings))
@@ -923,7 +998,7 @@ def main():
         meeting_name_to_pk[meeting.__name__] = meeting_pk
         # Meeting groups are meeting local objects within VoteIT4
         # System users are global within VoteIT3, so if we convert sys users -> meeting group
-        # we need to create several of them and replace the differently within meetings.
+        # we need to create several of them and replace them differently within meetings.
         userid_to_meeting_group_pk = {}
         for userid in meeting.system_userids:
             userid_to_meeting_group_pk[userid] = meeting_group_pk
@@ -1025,6 +1100,9 @@ def main():
             # end er loop
             electoral_register_pk += 1
 
+        # Prep for reactions (like button)
+        reaction_data = []
+
         # Walk all AIs and meeting content
         for ai in meeting.values():
             if ai.type_name != 'AgendaItem':
@@ -1057,7 +1135,7 @@ def main():
             items = {'Poll': [], 'Proposal': [], 'DiscussionPost': []}
             for obj in ai.values():
                 items[obj.type_name].append(obj)
-
+            #FIXME: Export LIKES for props and discussions
             for proposal in items['Proposal']:
                 assert len(proposal.creators) == 1
                 author_userid = proposal.creators[0]
@@ -1069,6 +1147,13 @@ def main():
                     export_proposal(proposal, proposal_pk, ai_pk, **kw)
                 )
                 proposal_uid_to_pk[proposal.uid] = proposal_pk
+                # Likes
+                for like_userid in request.registry.getAdapter(proposal, IUserTags, name='like'):
+                    local_reaction = export_reaction(reaction_pk, proposal, proposal_pk, reaction_button_pk, ai_pk, like_userid)
+                    if local_reaction:
+                        reaction_pk += 1
+                        reaction_data.append(local_reaction)
+
                 # But there might be more! Is this proposal a difftext one?
                 if proposal.diff_text_para is not None:
                     # Diff proposals have a 1-1 relation with their parent proposal. They prefer to use the same pk.
@@ -1088,6 +1173,12 @@ def main():
                 data.append(
                     export_discussion_post(discussion_post, discussion_post_pk, ai_pk, **kw)
                 )
+                # Likes
+                for like_userid in request.registry.getAdapter(discussion_post, IUserTags, name='like'):
+                    local_reaction = export_reaction(reaction_pk, discussion_post, discussion_post_pk, reaction_button_pk, ai_pk, like_userid)
+                    if local_reaction:
+                        reaction_pk += 1
+                        reaction_data.append(local_reaction)
                 # End post loop
                 discussion_post_pk += 1
             for poll in items['Poll']:
@@ -1108,6 +1199,15 @@ def main():
 
             # END ai block - keep this last!
             ai_pk += 1
+
+        # Finish up reaction exports since we've collected all now.
+        if reaction_data:
+            data.append(
+                export_reaction_button(reaction_button_pk, meeting, meeting_pk)
+            )
+            data.extend(reaction_data)
+            #End reaction/like stuff
+            reaction_button_pk += 1
 
         # Speaker lists - we can only export one speaker list system since we don't know about relations to
         # categories for voteit3
@@ -1183,9 +1283,8 @@ def main():
 
     # FIXME: Röster som är duplicerade?
     # FIXME: presence ?
-    # FIXME: Exporten av resultatdata för schulze använder ranking istället för rating, så vi måste vända på siffrorna!
     # FIXME: Vad gör vi med ballot_data för historiska omröstningar?
-    # FIXME: Gilla-knappar blir problematiskt med tanke på ContentTypes i django - natural key?
+    # ALREADY FIXED: Exporten av resultatdata för schulze använder ranking istället för rating, så vi måste vända på siffrorna!
 
     if not critical_errors and long_tag_to_trunc:
         print("The following tags are too long and need to be adjusted:")
