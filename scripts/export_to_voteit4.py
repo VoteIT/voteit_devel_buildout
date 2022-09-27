@@ -450,6 +450,7 @@ def export_poll(poll, pk, meeting_pk, ai_pk, request, er_pk=None):
         #     strong_pairs: List[Tuple[Tuple[int, int], int]]
         #     tied_winners: Optional[List[int]]
         elif poll_plugin == 'schulze_stv':
+            add_error(poll, "schulze_stv")
             if 'tie_breaker' in result:
                 result['tie_breaker'] = [get_proposal_with_check(poll, x, request) for x in result['tie_breaker']]
             if 'tied_winners' in result:
@@ -720,7 +721,7 @@ def export_text_document(diff_text, pk, ai_pk):
         'fields': {
             'modified': django_format_datetime(diff_text.context.modified),
             'created': django_format_datetime(diff_text.context.created),
-            'title': diff_text.title,
+            'title': diff_text.title[:99], #Truncate insanely long
             'body': diff_text.text,
             'base_tag': diff_text.hashtag,
             'agenda_item': ai_pk,
@@ -851,7 +852,7 @@ def export_meeting_roles(pk, entry, meeting_pk):
     except KeyError:
         return
     assigned = set([role_map[x] for x in entry['groups'] if role_map[x]])
-    if 'moderator' in assigned:
+    if assigned:  # Participants aren't handled while raw-importing
         assigned.add('participant')
     return {
         'pk': pk,
