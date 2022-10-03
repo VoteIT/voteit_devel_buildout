@@ -10,6 +10,8 @@ from json import dump
 from json import dumps
 from uuid import uuid4
 
+from arche.security import ROLE_EDITOR
+from arche.security import ROLE_REVIEWER
 from arche_usertags.interfaces import IUserTags
 from pyramid.paster import bootstrap
 from pyramid.threadlocal import get_current_registry
@@ -36,8 +38,11 @@ from voteit.multiple_votes import MEETING_NAMESPACE
 # Settings
 SINGLE_ERROR = False
 ONLY_MEETING_NAME = None
+DIE_ON_CRITICAL = False
 REPORT_NOT_CLOSED = False
 REPORT_TRUNCATED_TAGS_AS_ERROR = False
+REPORT_SCHULZE_STV = False
+REPORT_EMPTY_POLLS = False
 
 userid_to_pk = {}
 user_pk_to_fullname = {}
@@ -57,6 +62,8 @@ emails = set()
 
 
 def get_pk_for_userid(userid, context=None, msg=None):
+    if userid=='staffan-rydblom':
+        userid='srydblom'
     needed_userids.add(userid)
     try:
         return userid_to_pk[userid]
@@ -126,6 +133,8 @@ poll_method_mapping = {
     'dutt_poll': 'dutt',
     'schulze_pr': 'schulze_pr',
     'schulze_stv': 'schulze_stv',
+    'irv': 'irv',
+    'repeated_irv':'repeated_irv',
 }
 
 
@@ -138,6 +147,8 @@ role_map = {
     ROLE_ADMIN: '',
     ROLE_MEETING_CREATOR: '',
     ROLE_OWNER: '',
+    ROLE_REVIEWER: '',
+    ROLE_EDITOR: '',
 }
 
 
@@ -152,6 +163,8 @@ def add_error(obj, msg, critical=False, **kwargs):
     if critical:
         critical_errors.add(msg)
         msg = "CRIT: " + msg
+        if DIE_ON_CRITICAL:
+            raise Exception(msg)
     if SINGLE_ERROR and msg in unique_errors:
         return
     errs = errors.setdefault(resource_path(obj), [])
@@ -360,6 +373,38 @@ def get_proposal_with_check(referencing_obj, uid, request):
                   meeting=resource_path(maybe_other_meeting))
     return proposal_uid_to_pk[uid]
 
+def reformat_stv_like_result(poll, request, result):
+    result['winners'] = result['approved'] = [get_proposal_with_check(poll, x, request) for x in result['winners']]
+    result['candidates'] = [get_proposal_with_check(poll, x, request) for x in result['candidates']]
+    result['denied'] = list(set(result['candidates']) - set(result['approved']))
+    rounds = []
+    for round_data in result['rounds']:
+        # Expects:
+        # class STVResultRoundSchema(BaseModel):
+        #     method: str
+        #     status: str
+        #     selected: List[int]
+        #     vote_count: List[Tuple[int, Decimal]]
+        round = {}
+        round.update(round_data)
+        round['selected'] = [get_proposal_with_check(poll, x, request) for x in round_data['selected']]
+        round['vote_count'] = []
+        for x in round_data['vote_count']:
+            # A dict
+            for k, v in x.items():
+                round['vote_count'].append([get_proposal_with_check(poll, k, request), str(v)])
+        rounds.append(round)
+    result['rounds'] = rounds
+    # Must exist!
+    result.setdefault('empty_ballot_count', 0)
+    # {u'complete': False, u'quota': 1, u'randomized': False, u'winners': (u'cf555e02-dab9-4520-84fe-6fe3da786105',),
+    #  u'candidates': (u'9a532d8c-ea42-496c-9eb2-e61a504381bd', u'e60f4303-d163-406c-9357-8a5bdfa2c7ed',
+    #                  u'cf555e02-dab9-4520-84fe-6fe3da786105'), u'runtime': 0.0009920597076416016, u'rounds': (
+    # {u'status': u'Elected', u'vote_count': ({u'9a532d8c-ea42-496c-9eb2-e61a504381bd': Decimal('0')},
+    #                                         {u'e60f4303-d163-406c-9357-8a5bdfa2c7ed': Decimal('0')},
+    #                                         {u'cf555e02-dab9-4520-84fe-6fe3da786105': Decimal('2')}),
+    #  u'selected': (u'cf555e02-dab9-4520-84fe-6fe3da786105',), u'method': u'Direct'},), u'empty_ballot_count': 0}
+
 @debugencode
 def export_poll(poll, pk, meeting_pk, ai_pk, request, er_pk=None):
     state = poll.get_workflow_state()
@@ -371,7 +416,8 @@ def export_poll(poll, pk, meeting_pk, ai_pk, request, er_pk=None):
         add_error(poll, 'Poll open without er, aborting export')
         return
     if not poll.poll_result and is_closed:
-        add_error(poll, 'Skipping poll without result data:\n{res}', res=poll.poll_result)
+        if REPORT_EMPTY_POLLS:
+            add_error(poll, 'Skipping poll without result data:\n{res}', res=poll.poll_result)
         return
     # Make sure there are no cross-linked proposals!
     proposals = []
@@ -403,6 +449,22 @@ def export_poll(poll, pk, meeting_pk, ai_pk, request, er_pk=None):
             poll_plugin = 'schulze'
             if is_closed:
                 result = result['rounds'][0]
+    elif poll_plugin == 'repeated_irv':
+        winners = settings.get('winners', None)
+        if winners is None:
+            if is_closed:
+                settings['winners'] = len(result['winners'])
+            else:
+                settings['winners'] = 1
+        if settings['winners'] == 1:
+            if is_closed:
+                #We're going to assume incomplete result and just bugger off.
+                if len(result['winners']) > 1:
+                    print("Eh...")
+                    import pdb;pdb.set_trace()
+            # Someone has done silly stuff
+            poll_plugin = 'irv'
+
     elif poll_plugin == 'scottish_stv':
         winners = settings.get('winners', None)
         if winners is None:
@@ -450,7 +512,8 @@ def export_poll(poll, pk, meeting_pk, ai_pk, request, er_pk=None):
         #     strong_pairs: List[Tuple[Tuple[int, int], int]]
         #     tied_winners: Optional[List[int]]
         elif poll_plugin == 'schulze_stv':
-            add_error(poll, "schulze_stv")
+            if REPORT_SCHULZE_STV:
+                add_error(poll, "schulze_stv")
             if 'tie_breaker' in result:
                 result['tie_breaker'] = [get_proposal_with_check(poll, x, request) for x in result['tie_breaker']]
             if 'tied_winners' in result:
@@ -461,43 +524,13 @@ def export_poll(poll, pk, meeting_pk, ai_pk, request, er_pk=None):
                 result['tied_winners'] = tied
             result['candidates'] = [get_proposal_with_check(poll, x, request) for x in result['candidates']]
             if 'winners' not in result:
-                add_error(poll, "No winners in result data, skipping")
+                if REPORT_EMPTY_POLLS:
+                    add_error(poll, "No winners in result data, skipping")
                 return
             result['winners'] = result['approved'] = [get_proposal_with_check(poll, x, request) for x in result['winners']]
             # Let's not care about the other parts
             result.pop('actions', None)
             result['denied'] = list(set(result['candidates']) - set(result['winners']))
-        elif poll_plugin == 'scottish_stv':
-            result['winners'] = result['approved'] = [get_proposal_with_check(poll, x, request) for x in result['winners']]
-            result['candidates'] = [get_proposal_with_check(poll, x, request) for x in result['candidates']]
-            result['denied'] = list(set(result['candidates']) - set(result['approved']))
-            rounds = []
-            for round_data in result['rounds']:
-                # Expects:
-                # class STVResultRoundSchema(BaseModel):
-                #     method: str
-                #     status: str
-                #     selected: List[int]
-                #     vote_count: List[Tuple[int, Decimal]]
-                round = {}
-                round.update(round_data)
-                round['selected'] = [get_proposal_with_check(poll, x, request) for x in round_data['selected']]
-                round['vote_count'] = []
-                for x in round_data['vote_count']:
-                    # A dict
-                    for k, v in x.items():
-                        round['vote_count'].append([get_proposal_with_check(poll, k, request), str(v)])
-                rounds.append(round)
-            result['rounds'] = rounds
-            # Must exist!
-            result.setdefault('empty_ballot_count', 0)
-            # {u'complete': False, u'quota': 1, u'randomized': False, u'winners': (u'cf555e02-dab9-4520-84fe-6fe3da786105',),
-            #  u'candidates': (u'9a532d8c-ea42-496c-9eb2-e61a504381bd', u'e60f4303-d163-406c-9357-8a5bdfa2c7ed',
-            #                  u'cf555e02-dab9-4520-84fe-6fe3da786105'), u'runtime': 0.0009920597076416016, u'rounds': (
-            # {u'status': u'Elected', u'vote_count': ({u'9a532d8c-ea42-496c-9eb2-e61a504381bd': Decimal('0')},
-            #                                         {u'e60f4303-d163-406c-9357-8a5bdfa2c7ed': Decimal('0')},
-            #                                         {u'cf555e02-dab9-4520-84fe-6fe3da786105': Decimal('2')}),
-            #  u'selected': (u'cf555e02-dab9-4520-84fe-6fe3da786105',), u'method': u'Direct'},), u'empty_ballot_count': 0}
         elif poll_plugin == 'combined_simple':
             reformed_result = {}
             approved = []
@@ -547,7 +580,13 @@ def export_poll(poll, pk, meeting_pk, ai_pk, request, er_pk=None):
                     result['denied'] = [x['proposal'] for x in reformatted_results[1:]]
             if len(reformatted_results) == 1:  # Don't ask...
                 result['approved'] = [reformatted_results[0]['proposal']]
-
+        elif poll_plugin in ('scottish_stv', 'repeated_irv', 'irv'):
+            reformat_stv_like_result(poll, request, result)
+        else:
+            print("No such poll plugin %s" % poll_plugin)
+            add_error(poll, "No such poll plugin {poll_plugin} - skipping export", critical=True, poll_plugin=poll_plugin)
+            #import pdb;pdb.set_trace()
+            return
         result['vote_count'] = len(poll)
 
     data = {
@@ -598,7 +637,7 @@ def reverse_schulze_vote(poll, vote_data):
 @debugencode
 def export_vote(vote, pk, poll_pk, user_pk):
     if vote.__name__ not in userid_to_pk:
-        add_error(vote, "Duplicate vote, skipping")
+        add_error(vote, "Duplicate vote or deleted user")
         return
     orig_vote_data = vote.get_vote_data()
     poll = vote.__parent__
@@ -629,14 +668,16 @@ def export_vote(vote, pk, poll_pk, user_pk):
         vote_data = dumps(sorted([proposal_uid_to_pk[x] for x in orig_vote_data['proposals']]))
         # Malformed previous export data:
         # vote_data = dumps({'choices': sorted([proposal_uid_to_pk[x] for x in orig_vote_data['proposals']])})
-    elif poll.poll_plugin == 'scottish_stv':
+    elif poll.poll_plugin in ('scottish_stv','irv', 'repeated_irv'):
         vote_data = ",".join([str(proposal_uid_to_pk[x]) for x in orig_vote_data['proposals']])
         # Malformed previous export data:
         # vote_data = dumps({'ranking': [proposal_uid_to_pk[x] for x in orig_vote_data['proposals']]})
     else:
-        print("Vote data for %s:" % poll.poll_plugin)
-        print(vote.get_vote_data())
-        sys.exit("Must handle vote data")
+        add_error(poll, "Must handle vote data for method {poll_plugin}", critical=True, poll_plugin=poll.poll_plugin)
+        return
+        #import pdb;pdb.set_trace()
+        #print(vote.get_vote_data())
+        #sys.exit("Must handle vote data")
     return {
         'pk': pk,
         'model': 'poll.vote',
@@ -691,7 +732,10 @@ def export_diff_proposal(pk, diff_text_para, ai_pk):
 
 @debugencode
 def export_discussion_post(discussion_post, pk, ai_pk, author_pk = None, meeting_group_pk = None):
-    assert bool(author_pk) != bool(meeting_group_pk)
+    if bool(author_pk) == bool(meeting_group_pk):
+        add_error(discussion_post, "DiscussionPost userid error, either author_pk or meeting_group_pk needed", critical=True)
+        #import pdb;pdb.set_trace()
+        return
     adjust_object_richtext_tags(discussion_post)
     body = convert_richtext_body(discussion_post.text)
     data = {
@@ -854,6 +898,9 @@ def export_meeting_roles(pk, entry, meeting_pk):
     assigned = set([role_map[x] for x in entry['groups'] if role_map[x]])
     if assigned:  # Participants aren't handled while raw-importing
         assigned.add('participant')
+    else:
+        # Don't export empty assigned. This will cause admins to be blanked, but no problem they can gain access again
+        return
     return {
         'pk': pk,
         'model': 'meeting.meetingroles',
