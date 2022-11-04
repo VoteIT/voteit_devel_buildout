@@ -422,7 +422,7 @@ def export_poll(poll, pk, meeting_pk, ai_pk, request, er_pk=None):
     if is_ongoing and er_pk is None:
         add_error(poll, 'Poll open without er, aborting export')
         return
-    if not poll.poll_result and is_closed:
+    if (not poll.poll_result or not len(poll)) and is_closed:
         if REPORT_EMPTY_POLLS:
             add_error(poll, 'Skipping poll without result data:\n{res}', res=poll.poll_result)
         return
@@ -881,6 +881,9 @@ def export_speaker_list_system(pk, meeting_pk, method_name, settings, safe_posit
 @debugencode
 def export_speaker(pk, user_pk, speaker_list_pk, created_ts, seconds):
     assert isinstance(seconds, int)
+    if seconds > 30000:
+        print "Speaker seconds %s" % seconds
+        seconds = 30000  # Less than smallint :P
     return {
         'pk': pk,
         'model': 'speaker.speaker',
@@ -900,7 +903,7 @@ def export_speaker_list(pk, speaker_system_pk, agenda_item_pk, sl_title):
         'pk': pk,
         'model': 'speaker.speakerlist',
         'fields': {
-            'title': sl_title,
+            'title': sl_title[:200],
             'state': 'closed',
             'speaker_system': speaker_system_pk,
             'agenda_item': agenda_item_pk,
