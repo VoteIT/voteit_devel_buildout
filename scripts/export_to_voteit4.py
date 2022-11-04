@@ -37,12 +37,13 @@ from voteit.irl.models.interfaces import IParticipantNumbers
 from voteit.multiple_votes import MEETING_NAMESPACE
 # Settings
 SINGLE_ERROR = False
-ONLY_MEETING_NAME = None
+ONLY_MEETING_NAMES=[]
 DIE_ON_CRITICAL = False
 REPORT_NOT_CLOSED = False
 REPORT_TRUNCATED_TAGS_AS_ERROR = False
 REPORT_SCHULZE_STV = False
 REPORT_EMPTY_POLLS = False
+REPORT_DUPLICATE_EMAIL = False
 
 userid_to_pk = {}
 user_pk_to_fullname = {}
@@ -55,15 +56,16 @@ diff_text_ai_pk_and_paragraph_to_pk = {}
 needed_userids = set()
 long_tag_to_trunc = {}
 
+userid_foce_swap_email = {
+}
+
 errors = {}
 unique_errors = set()
 critical_errors = set()
-emails = set()
+email_to_userid={}
 
 
 def get_pk_for_userid(userid, context=None, msg=None):
-    if userid=='staffan-rydblom':
-        userid='srydblom'
     needed_userids.add(userid)
     try:
         return userid_to_pk[userid]
@@ -265,15 +267,20 @@ def export_root(obj):
 
 @debugencode
 def export_user(user, pk):
-    if user.email_validated and user.email:
-        email = user.email.lower()
-        if email in emails:
-            add_error(user, 'Duplicate email: {email}', email=email)
-        emails.add(email)
-    else:
-        email = ""
     if user.userid != user.userid.lower():
         raise ValueError("Uppercase userid: %s" % user.userid)
+    # Even if the email address isn't validated, it shouldn't matter that much since to
+    # inherit the account it needs to be validated
+    if user.email:
+        email = user.email.lower()
+        if user.userid in userid_foce_swap_email:
+            print("Force-swapping email %s -> %s" % (email, userid_foce_swap_email[user.userid]))
+            email = userid_foce_swap_email[user.userid]
+        if email in email_to_userid and REPORT_DUPLICATE_EMAIL:
+            add_error(user, 'Duplicate email: {email} also used by userid {userid}',  userid=email_to_userid[email], email=email)
+        email_to_userid[email] = user.userid
+    else:
+        email = ""
     return {
         'pk': pk,
         'model':'core.user',
@@ -312,7 +319,7 @@ def export_meeting(meeting, pk):
         'pk': pk,
         'model': 'meeting.meeting',
         'fields': {
-            'title': meeting.title,
+            'title': meeting.title[:100],
             'modified': django_format_datetime(meeting.modified),
             'created': django_format_datetime(meeting.created),
             'body': meeting.body,
@@ -464,7 +471,9 @@ def export_poll(poll, pk, meeting_pk, ai_pk, request, er_pk=None):
                     import pdb;pdb.set_trace()
             # Someone has done silly stuff
             poll_plugin = 'irv'
-
+        if settings['winners'] < 2 and poll_plugin=='repeated_irv':
+            print("Very broken repeated irv")
+            import pdb;pdb.set_trace()
     elif poll_plugin == 'scottish_stv':
         winners = settings.get('winners', None)
         if winners is None:
@@ -484,6 +493,8 @@ def export_poll(poll, pk, meeting_pk, ai_pk, request, er_pk=None):
             result['candidates'] = [get_proposal_with_check(poll, x, request) for x in result['candidates']]
             result['order'] = [get_proposal_with_check(poll, x, request) for x in result['order']]
             result['rounds'] = [{'winner': get_proposal_with_check(poll, x['winner'], request)} for x in result['rounds']]
+            result['approved'] = []
+            result['denied'] = []
         elif poll_plugin == 'schulze':
             if 'winner' not in result:
                 add_error(poll, "No winner in result data, skipping")
@@ -588,7 +599,6 @@ def export_poll(poll, pk, meeting_pk, ai_pk, request, er_pk=None):
             #import pdb;pdb.set_trace()
             return
         result['vote_count'] = len(poll)
-
     data = {
         'pk': pk,
         'model': 'poll.poll',
@@ -637,7 +647,7 @@ def reverse_schulze_vote(poll, vote_data):
 @debugencode
 def export_vote(vote, pk, poll_pk, user_pk):
     if vote.__name__ not in userid_to_pk:
-        add_error(vote, "Duplicate vote or deleted user")
+        add_error(vote, "Duplicate vote or deleted user", critical=True)
         return
     orig_vote_data = vote.get_vote_data()
     poll = vote.__parent__
@@ -693,8 +703,14 @@ def export_vote(vote, pk, poll_pk, user_pk):
 
 @debugencode
 def export_proposal(proposal, pk, ai_pk, author_pk=None, meeting_group_pk=None):
-    assert bool(author_pk) != bool(meeting_group_pk)
+    if bool(author_pk) == bool(meeting_group_pk):
+        add_error(proposal, "Proposal userid error, either author_pk or meeting_group_pk needed. Author was: {author}",
+                  author=proposal.creator[0], critical=True)
+        # import pdb;pdb.set_trace()
+        return
     adjust_object_richtext_tags(proposal)
+    if '\x00' in proposal.text:
+        add_error(proposal, "Proposal contains invalid unicode NULL char", critical=True)
     body = convert_richtext_body(proposal.text)
     data = {
         'pk': pk,
@@ -733,7 +749,8 @@ def export_diff_proposal(pk, diff_text_para, ai_pk):
 @debugencode
 def export_discussion_post(discussion_post, pk, ai_pk, author_pk = None, meeting_group_pk = None):
     if bool(author_pk) == bool(meeting_group_pk):
-        add_error(discussion_post, "DiscussionPost userid error, either author_pk or meeting_group_pk needed", critical=True)
+        add_error(discussion_post, "DiscussionPost userid error, either author_pk or meeting_group_pk needed. "
+                                   "Author was: {author}", critical=True, author=discussion_post.creator[0])
         #import pdb;pdb.set_trace()
         return
     adjust_object_richtext_tags(discussion_post)
@@ -759,6 +776,9 @@ def export_discussion_post(discussion_post, pk, ai_pk, author_pk = None, meeting
 
 @debugencode
 def export_text_document(diff_text, pk, ai_pk):
+    if len(diff_text.hashtag) > 40:
+        #We can't transform these!
+        raise Exception("Tag length %s" % len(diff_text.hashtag))
     return {
         'pk': pk,
         'model': 'proposal.textdocument',
@@ -1029,11 +1049,11 @@ def main():
     meetings = [x for x in root.values() if x.type_name == 'Meeting']
     print("Exporting %s meetings" % len(meetings))
     for meeting_pk, meeting in enumerate(meetings, start=1):
-        # Limit to a single meeting?
-        if ONLY_MEETING_NAME:
-            if meeting.__name__ != ONLY_MEETING_NAME:
-               continue
-            print("WARNING: Only exporting meeting with name %s" % ONLY_MEETING_NAME)
+        # Limit to a few meetings?
+        if ONLY_MEETING_NAMES:
+            if meeting.__name__ not in ONLY_MEETING_NAMES:
+                print("SKIPPING: %s" % meeting.__name__)
+                continue
         else:
             print("Exporting: %s" % meeting.__name__)
 
@@ -1096,6 +1116,8 @@ def main():
                     add_error(meeting, "WARNING: {userid} has several participant numbers. Export won't work!", userid=userid)
                     continue
                 assigned_userids.add(userid)
+                if userid != userid.lower():
+                    add_error(meeting, 'Upppercase userid in PN: %s' % userid)
                 data.append(
                     export_pn(pn_pk, pn, get_pk_for_userid(userid, context=meeting, msg="Missing user '{userid}' in PNS"), pn_system_pk, created_ts)
                 )
@@ -1279,10 +1301,12 @@ def main():
                     settings['max_times'] = speaker_list_count
                     assert isinstance(settings['max_times'], int)
                 elif v3_settings['speaker_list_plugin'] == 'female_priority':
-                    add_error(meeting, "'female_priority' speaker lists aren't handled. (path is meeting)")
-                    continue
+                    add_error(meeting, "'female_priority' speaker lists exported as priority.")
+                    method_name = 'priority'
+                    settings['max_times'] = speaker_list_count
+                    assert isinstance(settings['max_times'], int)
                 elif v3_settings['speaker_list_plugin'] == 'global_lists':
-                    add_error(meeting, "'global_lists' speaker lists aren't handled. (path is meeting)")
+                    add_error(meeting, "'global_lists' speaker lists aren't handled. (path is meeting)", critical=True)
                     continue
             if not method_name:
                 import pdb;pdb.set_trace()
@@ -1327,8 +1351,6 @@ def main():
             skipped += 1
     if skipped:
         print("Maybe we can skip export of %s users" % skipped)
-
-
     # FIXME: Röster som är duplicerade?
     # FIXME: presence ?
     # FIXME: Vad gör vi med ballot_data för historiska omröstningar?
