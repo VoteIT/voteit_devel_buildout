@@ -13,24 +13,39 @@ def main():
     args = parser.parse_args()
     env = bootstrap(args.config_uri)
     root = env['root']
-    print("---")
+    print("="*80)
     print("Finding managers for %s" % root.title)
-    users = root['users']
-    print "Email".ljust(40), "Userid".ljust(30), "Name"
-    for userid in find_authorized_userids(root, MANAGE_SERVER):
-        user = users[userid]
-        print user.email.ljust(40), user.userid.ljust(30), user.title
-
+    userids = find_authorized_userids(root, MANAGE_SERVER)
+    users = [root['users'][x] for x in userids]
+    print ("-"*80)
+    print "Emails"
+    print ("="*80)
+    for user in users:
+        print user.email
+    print ("-"*80)
+    print "Userid".ljust(30), "Name"
+    print ("="*80)
+    for user in users:
+        print user.userid.ljust(30), user.title
     print("-"*80)
     print("Checking meetings")
     multi=False
-    for meeting in [x for x in root.values() if x.type_name == 'Meeting']:
-        if MEETING_NAMESPACE in meeting:
-            print('Multi-votes activated in %s' % meeting.__name__)
-            multi=True
+    motion=False
+    for obj in root.values():
+        if obj.type_name == 'Meeting':
+            #[x for x in root.values() if x.type_name == 'Meeting']
+            if MEETING_NAMESPACE in obj:
+                print('Multi-votes activated in %s' % obj.__name__)
+                multi=True
+        if obj.type_name == 'MotionProcess':
+            print('Motion process in %s' % obj.__name__)
+            motion = True
     if not multi:
         print("No multi-votes meetings found")
-
+    if not motion:
+        print("No motion processes")
+    print("*"*80)
+    print("\n\n")
 
 if __name__ == '__main__':
     main()
