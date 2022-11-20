@@ -163,7 +163,7 @@ model_map = {
 
 def add_error(obj, msg, critical=False, **kwargs):
     if critical:
-        critical_errors.add(msg)
+        critical_errors.add(msg.format(**kwargs))
         msg = "CRIT: " + msg
         if DIE_ON_CRITICAL:
             raise Exception(msg)
@@ -267,8 +267,8 @@ def export_root(obj):
 
 @debugencode
 def export_user(user, pk):
-    if user.userid != user.userid.lower():
-        raise ValueError("Uppercase userid: %s" % user.userid)
+    #if user.userid != user.userid.lower():
+    #    raise ValueError("Uppercase userid: %s" % user.userid)
     # Even if the email address isn't validated, it shouldn't matter that much since to
     # inherit the account it needs to be validated
     if user.email:
@@ -369,6 +369,10 @@ def reformat_schulze_round(result):
     result['strong_pairs'] = [[[proposal_uid_to_pk[x] for x in k], v] for k, v in result['strong_pairs'].items()]
     if 'tied_winners' in result:
         result['tied_winners'] = [proposal_uid_to_pk[x] for x in result['tied_winners']]
+    if 'tie_breaker' in result:
+        result['tie_breaker'] = [proposal_uid_to_pk[x] for x in result['tie_breaker']]
+    #A set with nodes and edges for historic tie breaks - we're not going to care about this level of detail.
+    result.pop('actions', None)
 
 
 def get_proposal_with_check(referencing_obj, uid, request):
@@ -480,6 +484,10 @@ def export_poll(poll, pk, meeting_pk, ai_pk, request, er_pk=None):
             # So this setting is invalid, but 1 will be default in voteit. So if there's no data, we can just assume 1.
             add_error(poll, "Missing settings for Scottish STV, setting winners to 1. Will export")
             settings['winners'] = 1
+        if winners == 0:
+            add_error(poll, "Zero winner STV poll, can't export", critical=True)
+            return
+
     elif poll_plugin == 'dutt_poll':
         max_choices = settings.get('max', 0)
         min_choices = settings.get('min', 0)
@@ -1378,7 +1386,7 @@ def main():
     else:
         print("Everything worked as expected!")
     if critical_errors:
-        sys.exit("!!! %s critical errors - won't write!" % len(critical_errors))
+        sys.exit("!!! %s critical error types - won't write!" % len(critical_errors))
     filename = 'voteit4_export.json'
     print("Writing %s" % filename)
     with open(filename, "w") as stream:
