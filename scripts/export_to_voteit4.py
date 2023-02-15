@@ -14,7 +14,6 @@ from arche.security import ROLE_EDITOR
 from arche.security import ROLE_REVIEWER
 from arche_usertags.interfaces import IUserTags
 from pyramid.paster import bootstrap
-from pyramid.threadlocal import get_current_registry
 from pyramid.traversal import resource_path
 from pyramid.traversal import find_interface
 from voteit.core.helpers import AT_PATTERN
@@ -39,6 +38,7 @@ from voteit.multiple_votes import MEETING_NAMESPACE
 SINGLE_ERROR = False
 ONLY_MEETING_NAMES=[]
 DIE_ON_CRITICAL = False
+DEBUG_ENCODE=False
 REPORT_NOT_CLOSED = False
 REPORT_TRUNCATED_TAGS_AS_ERROR = False
 REPORT_SCHULZE_STV = False
@@ -55,6 +55,8 @@ proposal_uid_to_pk = {}
 diff_text_ai_pk_and_paragraph_to_pk = {}
 needed_userids = set()
 long_tag_to_trunc = {}
+pns_pn_check = {}
+pk_to_old_pns = {}
 
 userid_foce_swap_email = {
 }
@@ -177,6 +179,8 @@ def add_error(obj, msg, critical=False, **kwargs):
 def debugencode(fn):
     def _inner(*args,**kwargs):
         result = fn(*args, **kwargs)
+        if not DEBUG_ENCODE:
+            return result
         try:
             if not result:
                 return
@@ -191,21 +195,14 @@ def debugencode(fn):
 
     return _inner
 
-hashtag_tag = """
-<span class="mention" data-index="0" data-denotation-char="#" data-id="{tag}" data-value="{tag}">
-<span contenteditable="false"><span class="ql-mention-denotation-char">#</span>{tag}</span></span> 
+hashtag_tag = """<span class="mention" data-index="0" data-denotation-char="#" data-id="{tag}" data-value="{tag}"><span contenteditable="false"><span class="ql-mention-denotation-char">#</span>{tag}</span></span>
 """
-
 
 def mk_v4_hashtag(tag):
     return hashtag_tag.format(tag=tag)
 
-
-user_tag = """
-<span class="mention" data-index="0" data-denotation-char="@" data-id="{userid}" data-value="{name}">
-<span contenteditable="false"><span class="ql-mention-denotation-char">@</span>{name}</span></span>
+user_tag = """<span class="mention" data-index="0" data-denotation-char="@" data-id="{userid}" data-value="{name}"><span contenteditable="false"><span class="ql-mention-denotation-char">@</span>{name}</span></span>
 """
-
 
 def mk_v4_usertag(user_pk):
     assert isinstance(user_pk, int)
@@ -245,6 +242,22 @@ def text_to_v4_mention(text):
 
 def convert_richtext_body(text):
     return text_to_v4_hashtag(text_to_v4_mention(text))
+
+def add_paras(text):
+    if '<p>' in text.lower():
+        return text
+    text = text.strip()
+    text = re.sub(r"(\s*)[\n]{2,}", "</p>\n<p>", text)
+    reformatted = ""
+    for row in text.splitlines():
+        row = row.strip()
+        if not row.endswith(">"):
+            row += "<br/>"
+        reformatted += row + "\n"
+    text = "<p>" + reformatted + "</p>"
+    text = text.replace("<br/>\n</p>", "</p>")
+    text = re.sub(r"(<br/>\n){2,}", "</p>\n<p>", text, flags=re.DOTALL)
+    return text
 
 
 @debugencode
@@ -648,7 +661,8 @@ def reverse_schulze_vote(poll, vote_data):
     try:
         assert all(x[1] <= max_stars for x in vote_data)
     except AssertionError:
-        sys.exit("Poll %s contained settings max_stars %s" % (resource_path(poll), poll.poll_settings.get('max_stars')))
+        add_error(poll, "Poll contained setting max_stars {max_stars} but has votes with {max_vote}",
+                  critical=True, max_stars=poll.poll_settings.get('max_stars'), max_vote=max(x[1] for x in vote_data))
     return sorted([[x[0], max_stars-x[1]] for x in vote_data], key=lambda x: x[0])
 
 
@@ -714,12 +728,13 @@ def export_proposal(proposal, pk, ai_pk, author_pk=None, meeting_group_pk=None):
     if bool(author_pk) == bool(meeting_group_pk):
         add_error(proposal, "Proposal userid error, either author_pk or meeting_group_pk needed. Author was: {author}",
                   author=proposal.creator[0], critical=True)
-        # import pdb;pdb.set_trace()
         return
     adjust_object_richtext_tags(proposal)
     if '\x00' in proposal.text:
         add_error(proposal, "Proposal contains invalid unicode NULL char", critical=True)
     body = convert_richtext_body(proposal.text)
+    if proposal.diff_text_para is None:
+        body = add_paras(body)
     data = {
         'pk': pk,
         'model': 'proposal.proposal',
@@ -763,6 +778,7 @@ def export_discussion_post(discussion_post, pk, ai_pk, author_pk = None, meeting
         return
     adjust_object_richtext_tags(discussion_post)
     body = convert_richtext_body(discussion_post.text)
+    body = add_paras(body)
     data = {
         'pk': pk,
         'model': 'discussion.discussionpost',
@@ -821,6 +837,7 @@ def export_text_paragraph(text, pk, ts, paragraph_id, text_document_pk, ai_pk):
 
 @debugencode
 def export_pn_system(pk, meeting_pk):
+    pns_pn_check[pk] = set()
     return {
         'pk': pk,
         'model': 'participant_number.pnsystem',
@@ -832,6 +849,13 @@ def export_pn_system(pk, meeting_pk):
 
 @debugencode
 def export_pn(pk, number, user_pk, pns_pk, created_ts):
+    if number in pns_pn_check[pns_pk]:
+        add_error(pk_to_old_pns[pns_pk].context, "Duplicate participant number?", critical=True)
+    pns_pn_check[pns_pk].add(number)
+    if number < 1:
+        add_error(pk_to_old_pns[pns_pk].context, "<1 PN", critical=True)
+    if number > 2**15:
+        add_error(pk_to_old_pns[pns_pk].context, "Over small-int PN", critical=True)
     return {
         'pk': pk,
         'model': 'participant_number.participantnumber',
@@ -1113,6 +1137,7 @@ def main():
         pns = IParticipantNumbers(meeting)
         if len(pns.number_to_userid):
             pn_to_userid.update(pns.number_to_userid)
+            pk_to_old_pns[pn_system_pk] = pns
             data.append(
                 export_pn_system(pn_system_pk, meeting_pk)
             )
