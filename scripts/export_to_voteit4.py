@@ -58,7 +58,7 @@ long_tag_to_trunc = {}
 pns_pn_check = {}
 pk_to_old_pns = {}
 
-userid_foce_swap_email = {
+userid_force_swap_email = {
 }
 
 errors = {}
@@ -286,9 +286,9 @@ def export_user(user, pk):
     # inherit the account it needs to be validated
     if user.email:
         email = user.email.lower()
-        if user.userid in userid_foce_swap_email:
-            print("Force-swapping email %s -> %s" % (email, userid_foce_swap_email[user.userid]))
-            email = userid_foce_swap_email[user.userid]
+        if user.userid in userid_force_swap_email:
+            print("Force-swapping email %s -> %s" % (email, userid_force_swap_email[user.userid]))
+            email = userid_force_swap_email[user.userid]
         if email in email_to_userid and REPORT_DUPLICATE_EMAIL:
             add_error(user, 'Duplicate email: {email} also used by userid {userid}',  userid=email_to_userid[email], email=email)
         email_to_userid[email] = user.userid
