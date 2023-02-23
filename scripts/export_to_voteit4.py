@@ -4,6 +4,7 @@ from __future__ import unicode_literals
 import argparse
 import re
 import sys
+from collections import Counter
 from datetime import datetime
 from datetime import timedelta
 from json import dump
@@ -12,6 +13,7 @@ from uuid import uuid4
 
 from arche.security import ROLE_EDITOR
 from arche.security import ROLE_REVIEWER
+from arche.utils import resolve_uid
 from arche_usertags.interfaces import IUserTags
 from pyramid.paster import bootstrap
 from pyramid.traversal import resource_path
@@ -34,20 +36,32 @@ from voteit.debate.models import speaker_lists
 from voteit.irl.models.interfaces import IElectoralRegister
 from voteit.irl.models.interfaces import IParticipantNumbers
 from voteit.multiple_votes import MEETING_NAMESPACE
+
+try:
+    from voteit.vote_groups.interfaces import ROLE_PRIMARY
+    from voteit.vote_groups.interfaces import ROLE_STANDIN
+except ImportError:
+    ROLE_PRIMARY = ROLE_STANDIN = None
+
+
 # Settings
 SINGLE_ERROR = False
 ONLY_MEETING_NAMES=[]
 DIE_ON_CRITICAL = False
-DEBUG_ENCODE=False
+DEBUG_ENCODE = False
 REPORT_NOT_CLOSED = False
 REPORT_TRUNCATED_TAGS_AS_ERROR = False
 REPORT_SCHULZE_STV = False
 REPORT_EMPTY_POLLS = False
 REPORT_DUPLICATE_EMAIL = False
+REPORT_CK_MEETING_PARTICIPANT = False
+VOTE_GROUPS_NAMESPACE = '_vote_groups'
 
 userid_to_pk = {}
 user_pk_to_fullname = {}
 meeting_name_to_pk = {}
+meeting_to_user_pks = {}
+reported_meeting_to_user_pks = {}
 ai_name_to_pk = {}
 ai_uid_to_pk = {}
 proposal_uid_to_pk = {}
@@ -64,20 +78,37 @@ userid_force_swap_email = {
 errors = {}
 unique_errors = set()
 critical_errors = set()
-email_to_userid={}
+email_to_userid = {}
+ai_prop_ids = {}
+meeting_groupids = {}
 
-
-def get_pk_for_userid(userid, context=None, msg=None):
+def get_pk_for_userid(userid, context=None, msg=None, ck_meeting_pk=None):
     needed_userids.add(userid)
     try:
-        return userid_to_pk[userid]
+        user_pk = userid_to_pk[userid]
     except KeyError:
         if context:
             if msg is None:
                 msg="Missing user '{userid}'"
             add_error(context, msg,userid=userid, critical=True)
+            return
         else:
             raise
+    if ck_meeting_pk:
+        if user_pk not in meeting_to_user_pks[ck_meeting_pk]:
+            already_reported = reported_meeting_to_user_pks.setdefault(ck_meeting_pk, set())
+            if user_pk in already_reported:
+                return user_pk
+            # Figure out meeting name
+            meeting_name = "(Unknown meeting with export pk %s)" % ck_meeting_pk
+            for (k, v) in meeting_name_to_pk.items():
+                if v == ck_meeting_pk:
+                    meeting_name = k
+                    break
+            add_error(context, "ck_meeting_pk failed for meeting {meeting_name}, userid {userid} not part of meeting", meeting_name=meeting_name, userid=userid)
+            already_reported.add(user_pk)
+    return user_pk
+
 
 def truncate_tag(tag):
     """
@@ -164,14 +195,23 @@ model_map = {
 
 
 def add_error(obj, msg, critical=False, **kwargs):
+
+    def _get_path(obj):
+        try:
+            return resource_path(obj)
+        except AttributeError:
+            return str(obj) + " without traversal"
+
+
     if critical:
         critical_errors.add(msg.format(**kwargs))
         msg = "CRIT: " + msg
         if DIE_ON_CRITICAL:
-            raise Exception(msg)
+
+            raise Exception(_get_path(obj) + "   " + msg.format(**kwargs))
     if SINGLE_ERROR and msg in unique_errors:
         return
-    errs = errors.setdefault(resource_path(obj), [])
+    errs = errors.setdefault(_get_path(obj), [])
     errs.append(msg.format(**kwargs))
     unique_errors.add(msg)
 
@@ -309,9 +349,16 @@ def export_user(user, pk):
         }
     }
 
+def check_groupid(groupid, meeting_pk, meeting):
+    groupids = meeting_groupids.setdefault(meeting_pk, set())
+    if groupid in groupids:
+        add_error(meeting, "{groupid} not unique for meeting", groupid=groupid, critical=True)
+    groupids.add(groupid)
+
 
 @debugencode
-def export_meeting_group(user, pk, meeting_pk):
+def export_meeting_group_system_user_like(user, pk, meeting_pk, meeting):
+    check_groupid(user.userid, meeting_pk, meeting)
     return {
         'pk': pk,
         'model':'meeting.meetinggroup',
@@ -320,8 +367,74 @@ def export_meeting_group(user, pk, meeting_pk):
             'modified': django_format_datetime(user.modified),
             'title': user.title,
             'meeting': meeting_pk,
-            'members': [],
             'groupid': user.userid,
+        }
+    }
+
+# @debugencode
+# def export_meeting_group_mv_origin(va, pk, meeting_pk, meeting):
+#
+#     check_groupid(user.userid, meeting_pk, meeting)
+#     return {
+#         'pk': pk,
+#         'model':'meeting.meetinggroup',
+#         'fields': {
+#             'created': django_format_datetime(va.created),
+#             'modified': django_format_datetime(va.modified),
+#             'title': va.title,
+#             'meeting': meeting_pk,
+#             'groupid': va.userid,
+#         }
+#     }
+#     title = ""
+#     votes = 1
+#     userid_assigned = None
+
+
+@debugencode
+def export_meeting_group_vg_origin(vg, pk, meeting_pk, meeting):
+    check_groupid(vg.name, meeting_pk, meeting)
+    return {
+        'pk': pk,
+        'model':'meeting.meetinggroup',
+        'fields': {
+            'created': django_format_datetime(meeting.created), # No clue what to do otherwise
+            'modified': django_format_datetime(meeting.modified),
+            'title': vg.title,
+            'body': add_paras(vg.description),
+            'meeting': meeting_pk,
+            'groupid': vg.name,
+            'votes': len(list(vg.primaries)) or None,
+        }
+    }
+
+@debugencode
+def export_group_role(pk, meeting_pk, role_id='', title='', roles=()):
+    if len(role_id) > 100:
+        raise ValueError("role_id more than 100 chars: %s" % role_id)
+    if len(title) > 100:
+        raise ValueError("role title more than 100 chars: %s" % title)
+    return {
+        'pk': pk,
+        'model':'meeting.grouprole',
+        'fields': {
+            'title': title,
+            'meeting': meeting_pk,
+            'role_id': role_id,
+            'roles': list(roles) or None,
+        }
+    }
+
+@debugencode
+def export_group_membership(pk, user_pk, meeting_group_pk, role_pk=None, votes=None):
+    return {
+        'pk': pk,
+        'model':'meeting.groupmembership',
+        'fields': {
+            'user': user_pk,
+            'meeting_group': meeting_group_pk,
+            'role': role_pk,
+            'votes': votes,
         }
     }
 
@@ -724,7 +837,7 @@ def export_vote(vote, pk, poll_pk, user_pk):
 
 
 @debugencode
-def export_proposal(proposal, pk, ai_pk, author_pk=None, meeting_group_pk=None):
+def export_proposal(proposal, pk, ai_pk, author_pk=None, meeting_group_pk=None, meeting_pk=None):
     if bool(author_pk) == bool(meeting_group_pk):
         add_error(proposal, "Proposal userid error, either author_pk or meeting_group_pk needed. Author was: {author}",
                   author=proposal.creator[0], critical=True)
@@ -735,6 +848,10 @@ def export_proposal(proposal, pk, ai_pk, author_pk=None, meeting_group_pk=None):
     body = convert_richtext_body(proposal.text)
     if proposal.diff_text_para is None:
         body = add_paras(body)
+    prop_ids = ai_prop_ids.setdefault(ai_pk, set())
+    if proposal.aid in prop_ids:
+        add_error(proposal, "Duplicate aid / prop_id: {prop_id}", prop_id = proposal.aid, critical=True)
+    prop_ids.add(proposal.aid)
     data = {
         'pk': pk,
         'model': 'proposal.proposal',
@@ -746,7 +863,7 @@ def export_proposal(proposal, pk, ai_pk, author_pk=None, meeting_group_pk=None):
             'prop_id': proposal.aid,
             'agenda_item': ai_pk,
             'tags': proposal.tags,
-            'mentions': [get_pk_for_userid(x, context=proposal, msg="Missing user '{userid}' in mentions") for x in IMentioned(proposal).keys()]
+            'mentions': [get_pk_for_userid(x, context=proposal, ck_meeting_pk=meeting_pk, msg="Missing user '{userid}' in mentions") for x in IMentioned(proposal).keys()]
         },
     }
     if author_pk:
@@ -770,7 +887,7 @@ def export_diff_proposal(pk, diff_text_para, ai_pk):
 
 
 @debugencode
-def export_discussion_post(discussion_post, pk, ai_pk, author_pk = None, meeting_group_pk = None):
+def export_discussion_post(discussion_post, pk, ai_pk, author_pk = None, meeting_group_pk = None, meeting_pk = None):
     if bool(author_pk) == bool(meeting_group_pk):
         add_error(discussion_post, "DiscussionPost userid error, either author_pk or meeting_group_pk needed. "
                                    "Author was: {author}", critical=True, author=discussion_post.creator[0])
@@ -787,7 +904,7 @@ def export_discussion_post(discussion_post, pk, ai_pk, author_pk = None, meeting
             'created': django_format_datetime(discussion_post.created),
             'body': body,
             'tags': discussion_post.tags,
-            'mentions': [get_pk_for_userid(x, context=discussion_post, msg="Missing user '{userid}' in mentions") for x in IMentioned(discussion_post).keys()],
+            'mentions': [get_pk_for_userid(x, context=discussion_post, ck_meeting_pk=meeting_pk, msg="Missing user '{userid}' in mentions") for x in IMentioned(discussion_post).keys()],
             'agenda_item': ai_pk,
         },
     }
@@ -869,13 +986,14 @@ def export_pn(pk, number, user_pk, pns_pk, created_ts):
 
 
 @debugencode
-def export_electoral_register(pk, created_ts, meeting_pk):
+def export_electoral_register(pk, created_ts, meeting_pk, was_er=True):
     return {
         'pk': pk,
         'model': 'poll.electoralregister',
         'fields': {
             'created': django_format_datetime(created_ts, force=True),
             'meeting': meeting_pk,
+            'source': was_er and 'v3_er_export' or 'v3_voters_export',
         },
     }
 
@@ -914,7 +1032,7 @@ def export_speaker_list_system(pk, meeting_pk, method_name, settings, safe_posit
 def export_speaker(pk, user_pk, speaker_list_pk, created_ts, seconds):
     assert isinstance(seconds, int)
     if seconds > 30000:
-        print "Speaker seconds %s" % seconds
+        print("Speaker seconds %s" % seconds)
         seconds = 30000  # Less than smallint :P
     return {
         'pk': pk,
@@ -996,7 +1114,7 @@ def export_reaction_button(pk, meeting, meeting_pk, title="Gilla", icon='mdi-thu
 
 
 @debugencode
-def export_reaction(pk, context, object_id, button_pk, ai_pk, userid):
+def export_reaction(pk, context, object_id, button_pk, ai_pk, userid, meeting_pk = None):
     """
     :param pk: reactions pk
     :param context: what's reacted on
@@ -1015,7 +1133,6 @@ def export_reaction(pk, context, object_id, button_pk, ai_pk, userid):
         content_type = ["discussion", "discussionpost"]
     else:
         raise ValueError("Wrong context: %s" % context)
-
     return {
         'pk': pk,
         'model': 'reactions.reaction',
@@ -1023,7 +1140,7 @@ def export_reaction(pk, context, object_id, button_pk, ai_pk, userid):
             "content_type":content_type,
             'object_id': object_id,
             'button': button_pk,
-            'user': get_pk_for_userid(userid, context=context),
+            'user': get_pk_for_userid(userid, ck_meeting_pk=meeting_pk, context=context),
             'agenda_item': ai_pk,
         },
     }
@@ -1035,6 +1152,37 @@ def django_format_datetime(dt, force=False):
     if dt is not None:
         return dt.isoformat()
 
+
+class ERHandler:
+
+    def __init__(self):
+        self.cmp_vw_to_er = {}
+
+    def create_or_reuse(self, poll_data, er_data, vw_data, out_data):
+        """
+        :param poll_data: dict
+        :param er_data: dict
+        :param vw_data: list[dict]
+        :param out_data: list[dict]
+        :return: bool
+        """
+        key = self.get_cmp_key(vw_data)
+        # Reuse data
+        reused_pk = self.cmp_vw_to_er.get(key)
+        if reused_pk:
+            poll_data['fields']['electoral_register'] = reused_pk
+            return False
+        # Append new ER to data instead, we can't reuse
+        self.cmp_vw_to_er[key] = er_data['pk']
+        poll_data['fields']['electoral_register'] = er_data['pk']
+        out_data.append(er_data)
+        out_data.extend(vw_data)
+        return True
+
+    def get_cmp_key(self, vw_data):
+        return tuple(sorted(
+            [(x['fields']['user'], x['fields']['weight']) for x in vw_data]
+        ))
 
 def main():
     parser = argparse.ArgumentParser()
@@ -1059,11 +1207,11 @@ def main():
         maybe_export_users[user.userid] = export_user(user, user_pk)
         user_pk += 1
 
-    # FIXME: Should we export admins too?
-
     # Walk meetings and export contents
     ai_pk = 1
     meeting_group_pk = 1
+    group_role_pk = 1
+    group_membership_pk = 1
     poll_pk = 1
     vote_pk = 1
     proposal_pk = 1
@@ -1094,10 +1242,9 @@ def main():
 
         if MEETING_NAMESPACE in meeting:
             add_error(meeting, "Multi-votes activated, adjust export", critical=True)
-
-        data.append(
-            export_meeting(meeting, meeting_pk)
-        )
+        # In case we need to adjust data
+        meeting_out = export_meeting(meeting, meeting_pk)
+        data.append(meeting_out)
         meeting_name_to_pk[meeting.__name__] = meeting_pk
         # Meeting groups are meeting local objects within VoteIT4
         # System users are global within VoteIT3, so if we convert sys users -> meeting group
@@ -1108,10 +1255,16 @@ def main():
             needed_userids.add(userid)
             sys_user = users[userid]
             data.append(
-                export_meeting_group(sys_user, meeting_group_pk, meeting_pk)
+                export_meeting_group_system_user_like(sys_user, meeting_group_pk, meeting_pk, meeting)
             )
             # End meeting group loop
             meeting_group_pk += 1
+
+        if meeting.system_userids:
+            print(meeting.__name__ + 'has system users that will be groups: ' + ", ".join(meeting.system_userids))
+
+        # keep track of users in meeting
+        meeting_to_user_pks[meeting_pk] = set()
 
         # Export meeting roles
         maybe_new_er_userids = set()  # In case there's no er, create one with these
@@ -1126,6 +1279,7 @@ def main():
                 data.append(out)
                 if ROLE_VOTER in entry['groups']:
                     maybe_new_er_userids.add(entry['userid'])
+                meeting_to_user_pks[meeting_pk].add(get_pk_for_userid(entry['userid'], context=meeting))
                 # End roles loop
                 meeting_roles_pk += 1
             else:
@@ -1154,6 +1308,7 @@ def main():
                 assigned_userids.add(userid)
                 if userid != userid.lower():
                     add_error(meeting, 'Upppercase userid in PN: %s' % userid)
+
                 data.append(
                     export_pn(pn_pk, pn, get_pk_for_userid(userid, context=meeting, msg="Missing user '{userid}' in PNS"), pn_system_pk, created_ts)
                 )
@@ -1186,14 +1341,16 @@ def main():
                 exportable_ers.append({'userids': list(maybe_new_er_userids), 'time': time_ts})
 
         lastest_er_pk = None
+        # Note about ERs here, they may not reflect actual voters used during polls.
+        # We'll use vote data later on to simply construct an ER to get voter weight right.
         for register in exportable_ers:
-            # Seems like ER needs to be first, so delay appending voterweight
+            # Seems like ER needs to be first, so delay appending voter weight
             er_voters_data = []
             voters = []
             for userid in register['userids']:
                 er_voters_data.append(
                     export_voter_weight(voter_weight_pk, electoral_register_pk,
-                                        get_pk_for_userid(userid, context=meeting, msg="Missing user '{userid}' in ER"))
+                                        get_pk_for_userid(userid, context=meeting, ck_meeting_pk = meeting_pk, msg="Missing user '{userid}' in ER"))
                 )
                 voters.append(voter_weight_pk)
                 # end voter weight loop
@@ -1205,6 +1362,46 @@ def main():
             lastest_er_pk = electoral_register_pk
             # end er loop
             electoral_register_pk += 1
+
+        if MEETING_NAMESPACE in meeting:
+            raise
+            #print("Multivotes meeting: %s" % meeting.__name__)
+            #export_meeting_group_mv_origin(va, meeting_group_pk, meeting_pk, meeting)
+
+        if hasattr(meeting, VOTE_GROUPS_NAMESPACE):
+            # Adjust exported meeting
+            meeting_out['fields']['er_policy_name'] = 'main_subst_active'
+            meeting_out['fields']['installed_dialects'] = 'ordinarie_och_ersattare'
+            meeting_out['fields']['group_roles_active'] = True
+            meeting_out['fields']['group_votes_active'] = True
+            # Create group roles for this specific dialect
+            from_vg_roles = ['proposer', 'potential_voter', 'discusser']
+            data.append(
+                export_group_role(group_role_pk, meeting_pk,
+                                  title='Ordinarie', role_id='main', roles=from_vg_roles)
+            )
+            old_role_to_pk = {ROLE_PRIMARY: group_role_pk}
+            group_role_pk += 1
+            data.append(
+                export_group_role(group_role_pk, meeting_pk,
+                                  title='Ersättare', role_id='substitute', roles=from_vg_roles)
+            )
+            old_role_to_pk[ROLE_STANDIN] = group_role_pk
+            group_role_pk += 1
+
+            vg_data = getattr(meeting, VOTE_GROUPS_NAMESPACE)
+            for vg in vg_data.values():
+                data.append(export_meeting_group_vg_origin(vg, meeting_group_pk, meeting_pk, meeting))
+                # Create membership with roles
+                for userid, old_role in vg.items():
+                    data.append(
+                        export_group_membership(
+                            group_membership_pk, get_pk_for_userid(userid, context=vg), meeting_group_pk, role_pk=old_role_to_pk.get(old_role)
+                        )
+                    )
+                    group_membership_pk += 1
+                # end VG loop
+                meeting_group_pk+=1
 
         # Prep for reactions (like button)
         reaction_data = []
@@ -1248,14 +1445,14 @@ def main():
                 if author_userid in userid_to_meeting_group_pk:
                     kw = {'meeting_group_pk': userid_to_meeting_group_pk[author_userid]}
                 else:
-                    kw = {'author_pk': get_pk_for_userid(author_userid, context=proposal)}
+                    kw = {'author_pk': get_pk_for_userid(author_userid, ck_meeting_pk=meeting_pk, context=proposal)}
                 data.append(
-                    export_proposal(proposal, proposal_pk, ai_pk, **kw)
+                    export_proposal(proposal, proposal_pk, ai_pk, meeting_pk=meeting_pk, **kw)
                 )
                 proposal_uid_to_pk[proposal.uid] = proposal_pk
                 # Likes
                 for like_userid in request.registry.getAdapter(proposal, IUserTags, name='like'):
-                    local_reaction = export_reaction(reaction_pk, proposal, proposal_pk, reaction_button_pk, ai_pk, like_userid)
+                    local_reaction = export_reaction(reaction_pk, proposal, proposal_pk, reaction_button_pk, ai_pk, like_userid, meeting_pk = meeting_pk)
                     if local_reaction:
                         reaction_pk += 1
                         reaction_data.append(local_reaction)
@@ -1275,35 +1472,90 @@ def main():
                 if author_userid in userid_to_meeting_group_pk:
                     kw = {'meeting_group_pk': userid_to_meeting_group_pk[author_userid]}
                 else:
-                    kw = {'author_pk': get_pk_for_userid(author_userid, context=discussion_post)}
+                    kw = {'author_pk': get_pk_for_userid(author_userid, ck_meeting_pk=meeting_pk, context=discussion_post)}
                 data.append(
-                    export_discussion_post(discussion_post, discussion_post_pk, ai_pk, **kw)
+                    export_discussion_post(discussion_post, discussion_post_pk, ai_pk, meeting_pk=meeting_pk, **kw)
                 )
                 # Likes
                 for like_userid in request.registry.getAdapter(discussion_post, IUserTags, name='like'):
-                    local_reaction = export_reaction(reaction_pk, discussion_post, discussion_post_pk, reaction_button_pk, ai_pk, like_userid)
+                    local_reaction = export_reaction(reaction_pk, discussion_post, discussion_post_pk, reaction_button_pk, ai_pk, like_userid, meeting_pk = meeting_pk)
                     if local_reaction:
                         reaction_pk += 1
                         reaction_data.append(local_reaction)
                 # End post loop
                 discussion_post_pk += 1
-            for poll in items['Poll']:
-                out = export_poll(poll, poll_pk, meeting_pk, ai_pk, request, er_pk=lastest_er_pk)
-                if out:
-                    data.append(out)
 
-                    # And export votes
+            # ERs created via votes
+            er_handler = ERHandler()
+            for poll in items['Poll']:
+                poll_out = export_poll(poll, poll_pk, meeting_pk, ai_pk, request, er_pk=lastest_er_pk)
+                if not poll_out:
+                    continue
+
+
+                # Try to figure out voter weight and ER from poll
+                if poll.get_workflow_state() == 'closed':
+                    # We only care about this for closed - supporting ongoing polls is a bit too weird
+
+                    # And export votes - find unique ones
+                    non_cloned_votes = set()
+                    clone_weight = Counter()
+
                     for vote in poll.values():
-                        out = export_vote(vote, vote_pk, poll_pk, get_pk_for_userid(vote.creator[0], context=vote))
+                        if vote.__name__ == vote.creator[0]:
+                            non_cloned_votes.add(vote)
+                        elif vote.creator[0]:
+                            clone_weight[vote.creator[0]] += 1
+                        else:
+                            add_error(vote, "has no creator", critical=True)
+                            continue
+
+                    # Create ERs based on votes if there's nothing else to go on
+                    er_out = export_electoral_register(electoral_register_pk, poll.start_time, meeting_pk, was_er=False)
+                    vw_out = []
+                    er_userids = set([x.__name__ for x in non_cloned_votes])
+                    if clone_weight:
+                        # We have to settle with the votes we've got
+                        for userid in er_userids:
+                            vw_out.append(
+                                export_voter_weight(
+                                    voter_weight_pk, electoral_register_pk,
+                                    get_pk_for_userid(userid, context=poll, ck_meeting_pk=meeting_pk, msg="Missing user '{userid}' in poll"),
+                                    weight=1 + clone_weight[userid]
+                                )
+                            )
+                            voter_weight_pk += 1
+                    else:
+                        # We can create an ER from the users who had voting permission when the poll closed +
+                        # any others that may have added a vote
+                        if poll.voters_mark_closed:
+                            er_userids.update(poll.voters_mark_closed)
+                        for userid in er_userids:
+                            vw_out.append(
+                                export_voter_weight(
+                                    voter_weight_pk, electoral_register_pk,
+                                    get_pk_for_userid(userid, context=poll, ck_meeting_pk=meeting_pk, msg="Missing user '{userid}' in poll")
+                                )
+                            )
+                            voter_weight_pk += 1
+                    for vote in non_cloned_votes:
+                        out = export_vote(vote, vote_pk, poll_pk, get_pk_for_userid(vote.creator[0], ck_meeting_pk=meeting_pk, context=vote))
                         if out:
                             data.append(out)
                             # End vote loop
                             vote_pk += 1
 
-                    # End poll loop
-                    poll_pk += 1
+                    # We'll swap polls ER if needed
+                    if er_handler.create_or_reuse(poll_out, er_out, vw_out, data):
+                        # Returns None if a new was created
+                        electoral_register_pk += 1
 
-            # END ai block - keep this last!
+                # Finally append the poll data
+                data.append(poll_out)
+                # End poll loop
+                poll_pk += 1
+
+            # END AI block - keep this last!
             ai_pk += 1
 
         # Finish up reaction exports since we've collected all now.
@@ -1342,8 +1594,8 @@ def main():
                     settings['max_times'] = speaker_list_count
                     assert isinstance(settings['max_times'], int)
                 elif v3_settings['speaker_list_plugin'] == 'global_lists':
-                    add_error(meeting, "'global_lists' speaker lists aren't handled. (path is meeting)", critical=True)
-                    continue
+                    add_error(meeting, "'global_lists' speaker lists aren't handled, exported as 'simple'. (path is meeting)",) # We might not need to care about this
+                    method_name = 'simple'
             if not method_name:
                 import pdb;pdb.set_trace()
             data.append(
@@ -1351,7 +1603,10 @@ def main():
             )
             # We're not exporting active lists, queues or anything like that. Everything should be finished.
             for (k, sl) in sls.items():
-                ai_uid, num = k.split('/')
+                if '/' in k:
+                    ai_uid, _ = k.split('/')
+                else:
+                    ai_uid = k
                 if ai_uid not in ai_uid_to_pk:
                     # print("UID %s belongs to a deleted agenda item, won't export that speaker list" % ai_uid)
                     continue
@@ -1361,10 +1616,14 @@ def main():
                     if user_pn not in pn_to_userid:
                         continue  # We can't export historic items that are from an anonymous user
                     # This is certainly wrong, but we don't have any other data to use :(
-                    created_ts = sl.__parent__.modified
+                    try:
+                        created_ts = sl.__parent__.modified
+                    except AttributeError:
+                        ai = resolve_uid(request, ai_uid, perm=None)
+                        created_ts = ai.created
                     for seconds in spoken_times:
                         data.append(
-                            export_speaker(speaker_pk, get_pk_for_userid(pn_to_userid[user_pn]),
+                            export_speaker(speaker_pk, get_pk_for_userid(pn_to_userid[user_pn], ck_meeting_pk=meeting_pk),
                                            speaker_list_pk, created_ts, seconds)
                         )
                         # end speaker loop
@@ -1387,8 +1646,6 @@ def main():
             skipped += 1
     if skipped:
         print("Maybe we can skip export of %s users" % skipped)
-    # FIXME: Röster som är duplicerade?
-    # FIXME: presence ?
     # FIXME: Vad gör vi med ballot_data för historiska omröstningar?
     # ALREADY FIXED: Exporten av resultatdata för schulze använder ranking istället för rating, så vi måste vända på siffrorna!
 
