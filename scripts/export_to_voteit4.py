@@ -54,8 +54,8 @@ REPORT_TRUNCATED_TAGS_AS_ERROR = False
 REPORT_SCHULZE_STV = False
 REPORT_EMPTY_POLLS = False
 REPORT_DUPLICATE_EMAIL = False
-REPORT_CK_MEETING_PARTICIPANT = False
 VOTE_GROUPS_NAMESPACE = '_vote_groups'
+SFS_DELEGATIONS_NAMESPACE = '__delegations__'
 
 userid_to_pk = {}
 user_pk_to_fullname = {}
@@ -368,6 +368,23 @@ def export_meeting_group_system_user_like(user, pk, meeting_pk, meeting):
             'title': user.title,
             'meeting': meeting_pk,
             'groupid': user.userid,
+        }
+    }
+
+@debugencode
+def export_meeting_group_sfs_origin(delegation, pk, meeting_pk, meeting):
+    check_groupid(delegation.name, meeting_pk, meeting)
+    return {
+        'pk': pk,
+        'model':'meeting.meetinggroup',
+        'fields': {
+            'created': django_format_datetime(meeting.created),
+            'modified': django_format_datetime(meeting.modified),
+            'title': delegation.title,
+            'body': add_paras(delegation.description),
+            'meeting': meeting_pk,
+            'groupid': delegation.name,
+            'votes': delegation.vote_count,
         }
     }
 
@@ -1261,7 +1278,7 @@ def main():
             meeting_group_pk += 1
 
         if meeting.system_userids:
-            print(meeting.__name__ + 'has system users that will be groups: ' + ", ".join(meeting.system_userids))
+            print(meeting.__name__ + ' has system users that will be groups: ' + ", ".join(meeting.system_userids))
 
         # keep track of users in meeting
         meeting_to_user_pks[meeting_pk] = set()
@@ -1402,6 +1419,58 @@ def main():
                     group_membership_pk += 1
                 # end VG loop
                 meeting_group_pk+=1
+
+        if hasattr(meeting, SFS_DELEGATIONS_NAMESPACE):
+            import sfs_ga  # This is just a guard to avoid broken objects!
+            meeting_out['fields']['er_policy_name'] = 'gv_auto_before_p'
+            meeting_out['fields']['installed_dialects'] = 'sfsfum'
+            meeting_out['fields']['group_roles_active'] = True
+            meeting_out['fields']['group_votes_active'] = True
+            # Create group roles for this specific dialect
+            from_delegations_roles = ['proposer', 'potential_voter', 'discusser']
+            data.append(
+                export_group_role(group_role_pk, meeting_pk,
+                                  title='Delegationsledare', role_id='leader', roles=from_delegations_roles)
+            )
+            delegation_leader_pk = group_role_pk
+            group_role_pk += 1
+            data.append(
+                export_group_role(group_role_pk, meeting_pk,
+                                  title='Medlem', role_id='member', roles=from_delegations_roles)
+            )
+            delegation_member_pk = group_role_pk
+            group_role_pk += 1
+
+            delegations_data = getattr(meeting, SFS_DELEGATIONS_NAMESPACE)
+            for meeting_delegation in delegations_data.values():
+                data.append(
+                    export_meeting_group_sfs_origin(meeting_delegation, meeting_group_pk, meeting_pk, meeting)
+                )
+                # Create membership with roles - leaders
+                for userid in meeting_delegation.leaders:
+                    data.append(
+                        export_group_membership(
+                            group_membership_pk, get_pk_for_userid(userid, context=meeting_delegation), meeting_group_pk,
+                            role_pk=delegation_leader_pk, votes=meeting_delegation.voters.get(userid),
+                        )
+                    )
+                    group_membership_pk += 1
+                # Create membership with roles - members
+                for userid in meeting_delegation.members:
+                    if userid in meeting_delegation.leaders:
+                        # Only one role in v4!
+                        continue
+                    data.append(
+                        export_group_membership(
+                            group_membership_pk, get_pk_for_userid(userid, context=meeting_delegation), meeting_group_pk,
+                            role_pk=delegation_member_pk, votes=meeting_delegation.voters.get(userid),
+                        )
+                    )
+                    group_membership_pk += 1
+
+                # end VG loop
+                meeting_group_pk += 1
+            #END SFS
 
         # Prep for reactions (like button)
         reaction_data = []
