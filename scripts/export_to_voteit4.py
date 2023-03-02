@@ -6,7 +6,6 @@ import re
 import sys
 from collections import Counter
 from datetime import datetime
-from datetime import timedelta
 from json import dump
 from json import dumps
 from uuid import uuid4
@@ -1175,6 +1174,12 @@ class ERHandler:
     def __init__(self):
         self.cmp_vw_to_er = {}
 
+    def track_original_er(self, er_data, vw_data):
+        key = self.get_cmp_key(vw_data)
+        if key not in self.cmp_vw_to_er:
+            # Only save first key, they may be identical when using v3 ERs
+            self.cmp_vw_to_er[key] = er_data['pk']
+
     def create_or_reuse(self, poll_data, er_data, vw_data, out_data):
         """
         :param poll_data: dict
@@ -1284,7 +1289,7 @@ def main():
         meeting_to_user_pks[meeting_pk] = set()
 
         # Export meeting roles
-        maybe_new_er_userids = set()  # In case there's no er, create one with these
+        maybe_new_er_userids = set()  # In case there's no ER, create one with these
         for entry in meeting.get_security():
             if entry['userid'].lower() != entry['userid']:
                 add_error(meeting, 'UserID with uppercase in get_security(): {userid}', userid=entry['userid'])
@@ -1334,48 +1339,47 @@ def main():
             # End pn system
             pn_system_pk += 1
 
+        # ERs created via votes and maybe original ers
+        er_handler = ERHandler()
+
         # Electoral registers - might not exist
         electoral_registers = IElectoralRegister(meeting)
-
-        exportable_ers = []
-        exportable_ers.extend(electoral_registers.registers.values())
-        # Maybe always export voters...?
-        if maybe_new_er_userids:
-            if exportable_ers:
-                # We may need to extend with current users if the existing er is wrong?
-                last_er = exportable_ers[-1]
-                if set(last_er['userids']) != maybe_new_er_userids:
-                    # We don't really have good data for this - but the newly created one must have the newest timestamp
-                    time_ts = last_er['time'] + timedelta(minutes=1)
-                    exportable_ers.append({'userids': list(maybe_new_er_userids), 'time': time_ts})
-            else:
-                # We have no clue about time but let's use the meeting start time?
-                # Make it look like an electoral register
-                time_ts = meeting.start_time
-                if not time_ts:
-                    # This may happen for meetings that haven't started
-                    time_ts = meeting.created
-                exportable_ers.append({'userids': list(maybe_new_er_userids), 'time': time_ts})
-
         lastest_er_pk = None
         # Note about ERs here, they may not reflect actual voters used during polls.
         # We'll use vote data later on to simply construct an ER to get voter weight right.
-        for register in exportable_ers:
-            # Seems like ER needs to be first, so delay appending voter weight
-            er_voters_data = []
-            voters = []
+        for register in electoral_registers.registers.values():
+            vw_data = []
             for userid in register['userids']:
-                er_voters_data.append(
+                vw_data.append(
                     export_voter_weight(voter_weight_pk, electoral_register_pk,
                                         get_pk_for_userid(userid, context=meeting, ck_meeting_pk = meeting_pk, msg="Missing user '{userid}' in ER"))
                 )
-                voters.append(voter_weight_pk)
                 # end voter weight loop
                 voter_weight_pk += 1
-            data.append(
-                export_electoral_register(electoral_register_pk, created_ts=register['time'], meeting_pk=meeting_pk)
-            )
-            data.extend(er_voters_data)
+            er_data = export_electoral_register(electoral_register_pk, created_ts=register['time'], meeting_pk=meeting_pk)
+            er_handler.track_original_er(er_data, vw_data)
+            data.append(er_data)
+            data.extend(vw_data)
+            lastest_er_pk = electoral_register_pk
+            # end er loop
+            electoral_register_pk += 1
+
+        # In case we have no ERs
+        if lastest_er_pk is None:
+            vw_data = []
+            for userid in maybe_new_er_userids:
+                vw_data.append(
+                    export_voter_weight(voter_weight_pk, electoral_register_pk,
+                                        get_pk_for_userid(userid, context=meeting, ck_meeting_pk=meeting_pk,
+                                                          msg="Missing user '{userid}' in ER"))
+                )
+                # end voter weight loop
+                voter_weight_pk += 1
+            er_data = export_electoral_register(electoral_register_pk, created_ts=django_format_datetime(meeting.start_time),
+                                                meeting_pk=meeting_pk)
+            er_handler.track_original_er(er_data, vw_data)
+            data.append(er_data)
+            data.extend(vw_data)
             lastest_er_pk = electoral_register_pk
             # end er loop
             electoral_register_pk += 1
@@ -1554,13 +1558,10 @@ def main():
                 # End post loop
                 discussion_post_pk += 1
 
-            # ERs created via votes
-            er_handler = ERHandler()
             for poll in items['Poll']:
                 poll_out = export_poll(poll, poll_pk, meeting_pk, ai_pk, request, er_pk=lastest_er_pk)
                 if not poll_out:
                     continue
-
 
                 # Try to figure out voter weight and ER from poll
                 if poll.get_workflow_state() == 'closed':
