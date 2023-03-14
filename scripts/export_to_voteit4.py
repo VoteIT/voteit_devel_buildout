@@ -1375,7 +1375,7 @@ def main():
                 )
                 # end voter weight loop
                 voter_weight_pk += 1
-            er_data = export_electoral_register(electoral_register_pk, created_ts=django_format_datetime(meeting.start_time),
+            er_data = export_electoral_register(electoral_register_pk, created_ts=meeting.start_time or meeting.created,
                                                 meeting_pk=meeting_pk)
             er_handler.track_original_er(er_data, vw_data)
             data.append(er_data)
