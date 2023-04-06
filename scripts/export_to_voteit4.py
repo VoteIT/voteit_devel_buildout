@@ -1392,7 +1392,7 @@ def main():
         if hasattr(meeting, VOTE_GROUPS_NAMESPACE):
             # Adjust exported meeting
             meeting_out['fields']['er_policy_name'] = 'main_subst_active'
-            meeting_out['fields']['installed_dialects'] = 'ordinarie_och_ersattare'
+            meeting_out['fields']['installed_dialect'] = 'ordinarie_och_ersattare'
             meeting_out['fields']['group_roles_active'] = True
             meeting_out['fields']['group_votes_active'] = True
             # Create group roles for this specific dialect
@@ -1427,7 +1427,7 @@ def main():
         if hasattr(meeting, SFS_DELEGATIONS_NAMESPACE):
             import sfs_ga  # This is just a guard to avoid broken objects!
             meeting_out['fields']['er_policy_name'] = 'gv_auto_before_p'
-            meeting_out['fields']['installed_dialects'] = 'sfsfum'
+            meeting_out['fields']['installed_dialect'] = 'sfsfum'
             meeting_out['fields']['group_roles_active'] = True
             meeting_out['fields']['group_votes_active'] = True
             # Create group roles for this specific dialect
