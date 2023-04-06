@@ -17,6 +17,7 @@ from arche_usertags.interfaces import IUserTags
 from pyramid.paster import bootstrap
 from pyramid.traversal import resource_path
 from pyramid.traversal import find_interface
+from six import string_types
 from voteit.core.helpers import AT_PATTERN
 from voteit.core.helpers import TAG_PATTERN
 from voteit.core.models.interfaces import IDiffText
@@ -34,7 +35,7 @@ from voteit.debate.interfaces import ISpeakerListSettings
 from voteit.debate.models import speaker_lists
 from voteit.irl.models.interfaces import IElectoralRegister
 from voteit.irl.models.interfaces import IParticipantNumbers
-from voteit.multiple_votes import MEETING_NAMESPACE
+from voteit.multiple_votes import MEETING_NAMESPACE as MV_MEETING_NAMESPACE
 
 try:
     from voteit.vote_groups.interfaces import ROLE_PRIMARY
@@ -71,8 +72,7 @@ long_tag_to_trunc = {}
 pns_pn_check = {}
 pk_to_old_pns = {}
 
-userid_force_swap_email = {
-}
+userid_force_swap_email = {}
 
 errors = {}
 unique_errors = set()
@@ -80,6 +80,7 @@ critical_errors = set()
 email_to_userid = {}
 ai_prop_ids = {}
 meeting_groupids = {}
+meeting_role_check=set()
 
 def get_pk_for_userid(userid, context=None, msg=None, ck_meeting_pk=None):
     needed_userids.add(userid)
@@ -230,6 +231,10 @@ def debugencode(fn):
             raise
         if {'pk', 'fields', 'model'} != set(result):
             raise ValueError("Wrong keys in result: %s" % result.keys())
+        # Crude text check
+        for (k, v) in result['fields'].items():
+            if isinstance(v, string_types) and '\x00' in v:
+                raise ValueError("Null char in result:\n%s" % result)
         return result
 
     return _inner
@@ -387,24 +392,31 @@ def export_meeting_group_sfs_origin(delegation, pk, meeting_pk, meeting):
         }
     }
 
-# @debugencode
-# def export_meeting_group_mv_origin(va, pk, meeting_pk, meeting):
-#
-#     check_groupid(user.userid, meeting_pk, meeting)
-#     return {
-#         'pk': pk,
-#         'model':'meeting.meetinggroup',
-#         'fields': {
-#             'created': django_format_datetime(va.created),
-#             'modified': django_format_datetime(va.modified),
-#             'title': va.title,
-#             'meeting': meeting_pk,
-#             'groupid': va.userid,
-#         }
-#     }
-#     title = ""
-#     votes = 1
-#     userid_assigned = None
+@debugencode
+def export_meeting_group_mv_origin(va, pk, meeting_pk, meeting):
+    check_groupid(va.__name__, meeting_pk, meeting)
+    members=[]
+    if va.userid_assigned:
+        members.append(
+            get_pk_for_userid(va.userid_assigned, context=va, ck_meeting_pk=meeting_pk,
+                              msg="Missing user '{userid}' in va.userid_assigned")
+        )
+    return {
+        'pk': pk,
+        'model':'meeting.meetinggroup',
+        'fields': {
+            'created': django_format_datetime(va.created),
+            'modified': django_format_datetime(va.created),  # modified doesn't exist
+            'title': va.title,
+            'meeting': meeting_pk,
+            'groupid': va.__name__,
+            'votes': va.votes,
+            'members': members
+        }
+    }
+
+
+
 
 
 @debugencode
@@ -480,12 +492,12 @@ def export_ai(ai, pk, meeting_pk):
         'pk': pk,
         'model': 'agenda.agendaitem',
         'fields': {
-            'title': ai.title[:100],  # Truncate insanely long ais
+            'title': ai.title[:100].replace('\x00', ''),  # Truncate insanely long ais and remove odd null chars
             'modified': django_format_datetime(ai.modified),
             'created': django_format_datetime(ai.created),
             'body': ai.body,
             'state': ai.get_workflow_state(),
-            #FIXME: These aren't valid for the new AIs, should we keep that data?
+            #FIXME: These aren't valid for the new AIs,
             # 'start_time': ai.start_time and django_format_datetime(ai.start_time) or None,
             # 'end_time': ai.end_time and django_format_datetime(ai.end_time) or None,
             'tags': list(ai.tags),
@@ -1078,7 +1090,7 @@ def export_speaker_list(pk, speaker_system_pk, agenda_item_pk, sl_title):
 
 
 @debugencode
-def export_meeting_roles(pk, entry, meeting_pk):
+def export_meeting_roles(pk, entry, meeting_pk, meeting):
     # No duplicates
     try:
         user_pk = get_pk_for_userid(entry['userid'])
@@ -1090,6 +1102,9 @@ def export_meeting_roles(pk, entry, meeting_pk):
     else:
         # Don't export empty assigned. This will cause admins to be blanked, but no problem they can gain access again
         return
+    if (meeting_pk, user_pk) in meeting_role_check:
+        add_error(meeting, "Duplicate role assignment for user_pk {user_pk}", user_pk=user_pk, critical=True)
+    meeting_role_check.add((meeting_pk, user_pk))
     return {
         'pk': pk,
         'model': 'meeting.meetingroles',
@@ -1262,8 +1277,6 @@ def main():
         else:
             print("Exporting: %s" % meeting.__name__)
 
-        if MEETING_NAMESPACE in meeting:
-            add_error(meeting, "Multi-votes activated, adjust export", critical=True)
         # In case we need to adjust data
         meeting_out = export_meeting(meeting, meeting_pk)
         data.append(meeting_out)
@@ -1296,7 +1309,7 @@ def main():
             if not entry['userid']:
                 add_error(meeting, 'Empty userid in get_security()')
                 continue
-            out = export_meeting_roles(meeting_roles_pk, entry, meeting_pk)
+            out = export_meeting_roles(meeting_roles_pk, entry, meeting_pk, meeting)
             if out:
                 data.append(out)
                 if ROLE_VOTER in entry['groups']:
@@ -1384,11 +1397,18 @@ def main():
             # end er loop
             electoral_register_pk += 1
 
-        if MEETING_NAMESPACE in meeting:
-            raise
-            #print("Multivotes meeting: %s" % meeting.__name__)
-            #export_meeting_group_mv_origin(va, meeting_group_pk, meeting_pk, meeting)
-
+        if MV_MEETING_NAMESPACE in meeting:
+            print("Multivotes meeting: %s" % meeting.__name__)
+            meeting_out['fields']['er_policy_name'] = 'group_auto_eq_rnd_bf'
+            meeting_out['fields']['group_votes_active'] = True
+            meeting_out['fields']['installed_dialect'] = 'groupvotes'
+            multivotes=meeting[MV_MEETING_NAMESPACE]
+            for va in multivotes.values():
+                data.append(
+                    export_meeting_group_mv_origin(va, meeting_group_pk, meeting_pk, meeting)
+                )
+                # END MV loop
+                meeting_group_pk += 1
         if hasattr(meeting, VOTE_GROUPS_NAMESPACE):
             # Adjust exported meeting
             meeting_out['fields']['er_policy_name'] = 'main_subst_active'
