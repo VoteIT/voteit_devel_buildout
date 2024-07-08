@@ -1,6 +1,10 @@
 Buildout for VoteIT core development
 ====================================
 
+NOTE: This is the previous version of VoteIT that isn't maintained. It's only kept here as a public archive.
+The code for the current version of VoteIT (version 4) might not be published yet if you haven't found it here.
+
+
 Development instructions for VoteIT. You need to have:
 
 * a POSIX-compatible operating system. As far as we know, all Linux / UNIX
